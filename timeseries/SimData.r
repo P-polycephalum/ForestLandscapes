@@ -5,92 +5,8 @@ logit.pf <- function(kd,Td,x){
   return(out)
 }
 
-n.years  <- 7
-one.year <- seq(from=1,to=365,by=30)
-samp.days <- rep(one.year,n.years)
-n.inds <- 10
-all.days <- rep(samp.days,n.inds)
-n <- length(all.days)
-year.id  <- rep(rep(1:n.years, each = length(one.year)), n.inds)
-indv.id  <- rep(1:n.inds, each = length(samp.days))
-
-
-sigsq <- 0.45  #noise levels 
-kd <- 0.1
-Td <- 100
-mu.true <- logit.pf(kd=kd,Td=Td,x=all.days)
-
-norm.samps <- rnorm(n=n, mean=mu.true, sd=sqrt(sigsq))
-y.sims <- 1/(1+exp(norm.samps))
-
-df<- data.frame(
-  days=all.days,
-  indv=indv.id,
-  year=year.id,
-  y=y.sims
-)
-
-windows()
-ggplot(df, aes(x=days, y=y, color=as.factor(year))) +
-  geom_point() +
-  labs(title="Simulated phenology data",
-       y="Simulated y",
-       x="Day of year") +
-  theme_minimal()
-
-
-##JAGS model for intercept
-leaves <- function(){
-  lkd ~ dnorm(0,0.4)
-  kd <- exp(lkd)
-  ltd ~ dnorm(0,4)
-  Td <- exp(ltd)
-  ls ~ dnorm(0,1)
-  sigsq <- pow(exp(ls),2)
-  for(j in 1:n){
-    muf[j] <-  kd*(days[j]-Td)
-  }
-  for(k in 1:K){
-    for(i in 1:n){
-      X[i,k] ~ dnorm(muf[i],1/sigsq)
-    } 
-  }
-}
-
-
-
-test.data <- log(1-y.sims) - log(y.sims)
-data4dclone <- list(K=1, X=dcdim(data.matrix(test.data)), n=n, days=all.days)
-
-cl.seq <- c(1,4,8,16);
-n.iter<-10000;n.adapt<-5000;n.update<-100;thin<-10;n.chains<-3;
-
-cl<- makePSOCKcluster(3)
-out.parms <- c("kd", "Td", "sigsq")
-leaves.dclone <- dc.parfit(cl,data4dclone, params=out.parms, model=leaves, n.clones=cl.seq,
-                        multiply="K",unchanged="n",
-                        n.chains = n.chains, 
-                        n.adapt=n.adapt, 
-                        n.update=n.update,
-                        n.iter = n.iter, 
-                        thin=thin
-                        #inits=list(lkd=log(0.2), ltd=log(40))
-                        )
-
-dcdiag(leaves.dclone)
-summary(leaves.dclone)
-
-dctable <- dctable(leaves.dclone)
-windows()
-plot(dctable)
-windows()
-plot(dctable, type="log.var")
-
-
 #lets try real data with the same model
-
-
-data<- read.csv("timeseries/dataset_extracted/cavallinesia.csv")
+data<- read.csv("timeseries/dataset_extracted/dipteryx.csv")
 head(data)
 
 data <- data %>%
@@ -328,14 +244,16 @@ samp.days <- rep(one.year,n.years)
 n.inds <- 16
 
 all.days <- rep(samp.days,n.inds)
+
+all.days<- all_before_threshold$day
 n <- length(all.days)
 year.id  <- rep(rep(1:n.years, each = length(one.year)), n.inds)
 indv.id  <- rep(1:n.inds, each = length(samp.days))
 
-sigsq <- 0.45  #noise levels
-kd <- 0.1      #leaf drop rate
-Td <- 100      #day of year when 50% of leaves are dropped
-aV<- 15        #anual variability in Td
+sigsq <- 11  #noise levels
+kd <- 0.05      #leaf drop rate
+Td <- 120      #day of year when 50% of leaves are dropped
+aV<- 21        #anual variability in Td
                     
 uTd <- rnorm(n=n.years, mean=0, sd=aV)
 yTd <- Td + uTd[year.id]
@@ -360,16 +278,16 @@ ggplot(df, aes(x=days, y=y, group=as.factor(indv_year))) +
 
 
 leaves_year_global <- function(){
-  lkd ~ dnorm(0,0.4)
+  lkd ~ dnorm(log(0.1),0.4)
   kd <- exp(lkd)
 
-  ls ~ dnorm(0,1)
+  ls ~ dnorm(log(15),1)
   sigsq <- pow(exp(ls),2)
 
-  ltd ~ dnorm(log(120),1)
+  ltd ~ dnorm(log(100),1)
   Td <- exp(ltd)
 
-  log.aV ~ dnorm(log(15),1)
+  log.aV ~ dnorm(log(15),4)
   aV <- exp(log.aV)
   tau <- 1/pow(aV,2) 
 
@@ -399,7 +317,7 @@ test.data <- log(1-y.sims) - log(y.sims)
 data4dclone <- list(K=1, X=dcdim(data.matrix(test.data)), n=n, days=all.days, year=year.id, nyear=n.years)
 
 cl.seq <- c(1,4,8,16);
-n.iter<-10000;n.adapt<-5000;n.update<-100;thin<-10;n.chains<-3;
+n.iter<-1000;n.adapt<-500;n.update<-100;thin<-10;n.chains<-3;
 
 cl <- makePSOCKcluster(3) 
 annual_model<- dc.parfit(cl,data4dclone, params=c("Td","kd","sigsq","uY"), model=leaves_year_global, n.clones=cl.seq,
@@ -409,11 +327,11 @@ annual_model<- dc.parfit(cl,data4dclone, params=c("Td","kd","sigsq","uY"), model
                         n.update=n.update,
                         n.iter = n.iter, 
                         thin=thin,
-                        partype= "balancing",
-                        inits=list(lkd=log(0.2),ltd=log(90))
-)
+                        partype= "balancing")
 
 sum_model <- summary(annual_model)
+coef(annual_model)
+dcdiag(annual_model)
 table_summary <- round(cbind(True_Value = c(Td, kd, sigsq, uTd), 
                              sum_model$statistics[, c("Mean", "SD", "R hat")], 
                              sum_model$quantiles[, c("2.5%", "97.5%")]), 2)
@@ -444,21 +362,21 @@ data4dclone <- list(K=1,
                     year=all_before_threshold$pheno_year,
                     nyear=length(unique(all_before_threshold$pheno_year)))
 
-cl.seq <- c(1,5,10,20);
+cl.seq <- c(1,4);
 n.iter<-10000;n.adapt<-5000;n.update<-100;thin<-10;n.chains<-3;
 cl <- makePSOCKcluster(3)
-cava.year <- dc.parfit(cl, data4dclone, params=c("Td","kd","sigsq","uY"), model=leaves_year_global, n.clones=cl.seq,
+cava.year <- dc.parfit(cl, data4dclone, params=c("Td","kd","sigsq","uY","tau"), model=leaves_year_global, n.clones=cl.seq,
                         multiply="K",unchanged=c("n","nyear"),
                         n.chains = n.chains, 
                         n.adapt=n.adapt, 
                         n.update=n.update,
                         n.iter = n.iter, 
-                        thin=thin,
-                        inits=list(lkd=log(0.1),ltd=log(120), log.aV=log(7)))
+                        thin=thin)
 
 
 #summmary of the model
 summary(cava.year)
+coef(cava.year)[["tau"]]^(-1/2)
 dcdiag(cava.year)
 quantile(cava.year, probs = c(0.025))[["Td"]]
 sum_model <- summary(cava.year)
