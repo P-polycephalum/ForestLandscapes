@@ -23,7 +23,7 @@ gdf_filtered = gdf[gdf['polygon_id'].isin(keys_to_keep)]
 print(f"Found {len(gdf_filtered)} polygons for species {spp} in plot {plot}.")
 
 # Extract unique global_ids from the filtered JSON
-def calculate_metrics(reference_geom, target_geom, print_results=True):
+def calculate_metrics(reference_geom, target_geom):
     if reference_geom is None or target_geom is None:
             print(f"Warning: Missing geometry for reference or target. Skipping metrics calculation.")
             
@@ -36,8 +36,8 @@ def calculate_metrics(reference_geom, target_geom, print_results=True):
         iou = intersection_area / union_area if union_area > 0 else 0
         f1= 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
         score = 0.6 * iou + (0.4 * f1)
-        if print_results:
-            print(f"GlobalID:, IoU: {iou:.2f}, Precision: {precision:.2f}, Recall: {recall:.2f}, F1: {f1:.2f}, Score: {score:.2f}")
+        # if print_results:
+        #     print(f"GlobalID:, IoU: {iou:.2f}, Precision: {precision:.2f}, Recall: {recall:.2f}, F1: {f1:.2f}, Score: {score:.2f}")
         return iou, precision, recall, f1, score
 
 
@@ -70,7 +70,7 @@ for global_id in unique_global_ids:
         #print(f"Processing polygon {row['polygon_id']}...")
         iou, precision, recall, f1, score = calculate_metrics(reference_geom, row['geometry'])
 
-        if score < 0.5:
+        if score < 0.6:
             print(f"Polygon {row['polygon_id']} has low similarity score ({score:.2f})")
             # we will transfer the reference geometry
             gdf_filtered.at[idx, 'geometry'] = reference_geom

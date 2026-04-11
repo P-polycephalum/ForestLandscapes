@@ -1,0 +1,25 @@
+\documentclass{article}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{mathrsfs}
+\usepackage[margin=1in]{geometry} % Reduce margins to use more of the page
+
+\begin{document}
+\begin{titlepage}
+   \vspace*{\stretch{1.0}}
+   \begin{center}
+      \Large\textbf{Tree Crown Area Allometries}\\
+      \large\textit{Vicente Vasquez}
+   \end{center}
+   \vspace*{\stretch{2.0}}
+\end{titlepage}
+
+\section{Introduction}
+
+We are trying to generate a model that generalizes the relationship between tree crown area and diameter at breast height (DBH). To that purpose we will experiment with different functional forms of the the allometric relationship.
+
+First, lets check the distribution of the crown area. 
+
+\begin{equation}
+    \log(CA) = \log(\alpha) + \left[\beta_0 + \beta_1 \cdot \frac{1}{1 + e^{-(\log(DBH)-c)/s}}\right] \cdot \log(DBH) + \epsilon
+\end{equation}

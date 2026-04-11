@@ -1,12 +1,17 @@
 library(pacman)
-p_load(dclone, MASS, ggplot2, snow, tidyverse, parallel)
+p_load(dclone, MASS, ggplot2, snow, tidyverse, parallel, gridExtra, lubridate, reshape2)
+
 logit.pf <- function(kd,Td,x){
   out <- kd*(x-Td)
   return(out)
 }
+logit.pf_inv <- function(kd,Td,x){
+  out <- 1/(1+exp(-kd*(x-Td)))
+  return(out)
+}
 
 #lets try real data with the same model
-data<- read.csv("timeseries/dataset_extracted/dipteryx.csv")
+data<- read.csv("cavallinesia_leafing_timeseries.csv")
 head(data)
 
 data <- data %>%
@@ -24,56 +29,140 @@ data <- data %>%
     tree_year= as.factor(paste0(tree, "_", pheno_year))
   )
 
-trees<- unique(data$tree)
-years<- unique(data$pheno_year)
+windows()
+ggplot(data, aes(x=day, y=y_norm, color=as.factor(tree_year))) +
+  geom_line() +
+  labs(title="Cavallinesia phenology data",
+       y="Normalized leafing",
+       x="Date") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+
+trees1<- unique(data$tree)
+years1<- unique(data$pheno_year)
 all_before_threshold <- data.frame()
-for (i in 1:length(trees)) {
-  for (j in 1:length(years)) {
-    subset_data <- data %>% filter(tree == trees[i], pheno_year == years[j])
+for (i in 1:length(trees1)) {
+  for (j in 1:length(years1)) {
+    subset_data <- data %>% filter(tree == trees1[i], pheno_year == years1[j])
     subset_data<- subset_data %>% arrange(day)
-    windows()
-    plot(subset_data$day, subset_data$y_norm, type='l', main=paste("Tree:", trees[i], "Year:", years[j]),
-         xlab="Day", ylab="Normalized Leafing")
+    
+    cat("Processing Tree:", trees1[i], "Year:", print(years1[j]), "N rows:", nrow(subset_data), "\n")
+    
+    if (nrow(subset_data) == 0) {
+      cat("  → No data for this tree-year combination\n\n")
+      next
+    }
+    
+    # windows()
+    # plot(subset_data$day, subset_data$y_norm, type='l', main=paste("Tree:", trees1[i], "Year:", years1[j]),
+    #      xlab="Day", ylab="Normalized Leafing")
+    
     #find values below threshold
     threshold <- 0.2
     below_threshold <- which(subset_data$y_norm < threshold)
-    last_item<-max(below_threshold)
-    #subset all values before last_item
-    if (length(below_threshold) > 0 && last_item < nrow(subset_data)) {
-      subset_before_threshold <- subset_data[1:last_item, ]
-      points(subset_before_threshold$day, subset_before_threshold$y_norm, col='red', pch=19)
-      all_before_threshold <- bind_rows(all_before_threshold, subset_before_threshold)
+    
+    
+    cat("  → Values below threshold:", length(below_threshold), "\n")
+    cat("  → Range of y_norm:", min(subset_data$y_norm, na.rm=T), "to", max(subset_data$y_norm, na.rm=T), "\n")
+    
+    if (length(below_threshold) == 0) {
+      cat("  → No values below threshold; skipping\n\n")
+      print(below_threshold)
+      next
     }
+    
+    first_item <- min(below_threshold, na.rm=TRUE)
+    cat("  → First below-threshold index:", first_item, "of", nrow(subset_data), "\n")
+    
+    #subset all values from first_item onwards
+    if (first_item > 1 && first_item <= nrow(subset_data)) {
+      subset_after_threshold <- subset_data[first_item:nrow(subset_data), ]
+      #points(subset_after_threshold$day, subset_after_threshold$y_norm, col='red', pch=19)
+      all_before_threshold <- bind_rows(all_before_threshold, subset_after_threshold)
+      cat("  → Added", nrow(subset_after_threshold), "rows\n\n")
+    } else {
       
-  }}
+      cat("  → First below-threshold item at start or beyond range; skipping\n\n")
+      print(first_item)
+      print(nrow(subset_data))
+      print(first_item > 1 && first_item <= nrow(subset_data))
+    }
+  }
+}
+
 
 windows()
-ggplot(all_before_threshold, aes(x=day, y=y_norm, color=as.factor(tree_year))) +
-  geom_point() +
+ggplot(all_before_threshold, aes(x=day, y=y_norm, group=tree_year, color=as.factor(pheno_year))) +
+  geom_line() +
   labs(title="Cavallinesia phenology data",
        y="Predicted leafing",
-       x="Day of year") +
+       x="Day of year",
+       color="Phenological Year") +
   theme_minimal()
+
+nrow(all_before_threshold)
+
+leaves <- function(){
+  kd ~ dunif(0, 2)
+  Td ~ dunif(90, 360)
+  sigsq ~ dunif(1.0E-6, 40)
+
+  for(j in 1:n){
+    muf[j] <- -kd * (days[j] - Td)
+  }
+
+  for(k in 1:K){
+    for(i in 1:n){
+      X[i,k] ~ dnorm(muf[i], 1/sigsq)
+    }
+  }
+}
 
 #logit transform 
 test.data <- log(1-all_before_threshold$y_norm) - log(all_before_threshold$y_norm)
 data4dclone <- list(K=1, X=dcdim(data.matrix(test.data)), n=nrow(all_before_threshold), days=all_before_threshold$day)
 cl.seq <- c(1,4,8,16);
-n.iter<-10000;n.adapt<-5000;n.update<-100;thin<-10;n.chains<-3;
+n.iter<-10000;n.adapt<-5000;n.update<-100;thin<-5;n.chains<-3;
 out.parms <- c("kd", "Td", "sigsq")
-cava.intercept <- dc.fit(data4dclone, params=out.parms, model=leaves, n.clones=cl.seq,
+cl<- makePSOCKcluster(3)
+cava.intercept <- dc.parfit(cl,data4dclone, params=out.parms, model=leaves, n.clones=cl.seq,
                         multiply="K",unchanged="n",
                         n.chains = n.chains, 
                         n.adapt=n.adapt, 
                         n.update=n.update,
                         n.iter = n.iter, 
                         thin=thin,
-                        inits=list(lkd=log(0.2), ltd=log(40))
+                        inits = list(
+                          list(kd = 0.1, Td = 90, sigsq = 10),
+                          list(kd = 0.2, Td = 200,  sigsq = 15),
+                          list(kd = 0.3, Td = 300, sigsq = 12)
+                        )
 )
 
 
-summary(cava.intercept)
-dcdiag(cava.intercept)
+table<-summary(cava.intercept)
+windows()
+grid.table(round(table$statistics[, c("Mean", "SD",'DC SD', "R hat")], 2))
+
+windows()
+plot(cava.intercept)
+
+mcmc_recortado <- cava.intercept[1:100, ]
+
+# Create one plot with all parameters and chains in different colors
+windows()
+
+plot(1:100, mcmc_recortado[[1]][, 'Td'], type='l', col='red', lwd=2,
+     main="Trace plot (first 100 iterations) - All parameters and chains",
+     xlab="Iteration", ylab="Parameter value", na.rm=T)
+lines(1:100, mcmc_recortado[[2]][, 'Td'], col='blue', lwd=2, lty=1)
+lines(1:100, mcmc_recortado[[3]][, 'Td'], col='green', lwd=2, lty=1)
+
+dcdiagtable <- dcdiag(cava.intercept)
+windows()
+grid.table(round(dcdiagtable, 2))
 cavatable <- dctable(cava.intercept)
 windows()
 plot(cavatable)
@@ -81,7 +170,7 @@ windows()
 plot(cavatable, type="log.var")
 
 #generate predicted values
-logit.pf(kd=coef(cava.intercept)["kd"],Td=coef(cava.intercept)["Td"],x=seq(1,365,1))->LC_values
+logit.pf(kd=-coef(cava.intercept)["kd"],Td=coef(cava.intercept)["Td"],x=seq(1,365,1))->LC_values
 LC_values<- 1/(1+exp(LC_values))
 
 x <- seq(1, 365)
@@ -97,17 +186,9 @@ results_df <- data.frame(
 head(results_df)
 
 #what date is 90%
-results_df %>%
-  filter(y <= 0.9) %>%
-  slice(1)
-
-results_df %>%
-  filter(y <= 0.5) %>%
-  slice(1)
-
-results_df %>%
-  filter(y <= 0.1) %>%
-  slice(1)
+date10 <- results_df %>% filter(y <= 0.1) %>% slice(n())
+date50 <- results_df %>% filter(y <= 0.5) %>% slice(n()) 
+date90 <- results_df %>% filter(y <= 0.9) %>% slice(n()) 
 
 day_date<- seq(from=as.Date("2018-09-01"), to=as.Date("2019-08-31"), by="month")
 day_date_lookup <- data.frame(
@@ -131,9 +212,16 @@ ggplot(all_before_threshold,
     y = "Predicted leafing",
     x = "Date"
   ) +theme_minimal()+
-  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
-  geom_vline(xintercept = c(87,126, 165), linetype = "dashed", color = "black")
-  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")+
+  geom_vline(xintercept = c(date10 %>% pull(x),
+                             date50 %>% pull(x),
+                             date90 %>% pull(x)),
+             linetype = "dashed", color = "grey")
+
+print(date50)
+print(date90)
+print(date10)
 
 ######################
 #interannual simulation

@@ -6,14 +6,26 @@ logit.pf <- function(kd,Td,x){
 }
 
 n.years  <- 7
-one.year <- seq(from=1,to=365,by=30)
-samp.days <- rep(one.year,n.years)
-n.inds <- 10
-all.days <- rep(samp.days,n.inds)
-n <- length(all.days)
-year.id  <- rep(rep(1:n.years, each = length(one.year)), n.inds)
-indv.id  <- rep(1:n.inds, each = length(samp.days))
+# Sample 12 dates per year with 25-35 day gaps.
+make_year_days <- function(n_dates = 12, gap_min = 25, gap_max = 35, max_day = 365) {
+  repeat {
+    gaps <- sample(gap_min:gap_max, size = n_dates - 1, replace = TRUE)
+    start_day <- sample(1:5, size = 1)
+    days <- start_day + c(0, cumsum(gaps))
+    if (max(days) <= max_day) {
+      return(days)
+    }
+  }
+}
 
+year.days <- lapply(seq_len(n.years), function(x) make_year_days())
+samp.days <- unlist(year.days, use.names = FALSE)
+n.inds <- 10
+all.days <- rep(samp.days, n.inds)
+n <- length(all.days)
+year.id <- rep(seq_len(n.years), times = vapply(year.days, length, 1L))
+year.id <- rep(year.id, n.inds)
+indv.id <- rep(seq_len(n.inds), each = length(samp.days))
 
 sigsq <- 0.45  #noise levels 
 kd <- 0.1
@@ -39,7 +51,7 @@ ggplot(df, aes(x=days, y=y, color=as.factor(year))) +
   theme_minimal()
 
 
-##JAGS model for intercept
+##JAGS model for intercepts
 leaves <- function(){
   lkd ~ dnorm(0,0.4)
   kd <- exp(lkd)
