@@ -1,5 +1,5 @@
 library(pacman)
-p_load(dclone, MASS, ggplot2, snow, tidyverse, parallel)
+p_load(dclone, MASS, ggplot2, snow, tidyverse, parallel, gridExtra)
 logit.pf <- function(kd,Td,x){
   out <- kd*(x-Td)
   return(out)
@@ -25,19 +25,20 @@ leaves_year_fe <- function(){
 }
 
 data<- read.csv("cavallinesia_leafing_timeseries.csv")
-head(data)
 
-windows()
-ggplot(data, aes(x=date, y=leafing, color=as.factor(tag))) +
-  geom_line() + geom_point() +
-  labs(title="Cavallinesia platanifolia Leaf Cover ",
-       y="Leaf cover",
-       x="Date") +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1),
-        legend.position = "none")
+# head(data)
 
-ggsave("plots/phenology_timeseries.png", width=12, height=2)
+# windows()
+# ggplot(data, aes(x=date, y=leafing, color=as.factor(tag))) +
+#   geom_line() + geom_point() +
+#   labs(title="Cavallinesia platanifolia Leaf Cover ",
+#        y="Leaf cover",
+#        x="Date") +
+#   theme_minimal() +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1),
+#         legend.position = "none")
+
+# ggsave("plots/phenology_timeseries.png", width=12, height=2)
 
 data <- data %>%
   mutate(
@@ -54,15 +55,15 @@ data <- data %>%
     tree_year= as.factor(paste0(tree, "_", pheno_year))
   )
 
-windows()
-ggplot(data, aes(x=day, y=y_norm, color=as.factor(tree_year))) +
-  geom_line() +
-  labs(title="Cavallinesia phenology data",
-       y="Normalized leafing",
-       x="Date") +
-  theme_minimal() +
-  theme(axis.text.x = element_text(angle = 45, hjust = 1),
-        legend.position = "none")
+# windows()
+# ggplot(data, aes(x=day, y=y_norm, color=as.factor(tree_year))) +
+#   geom_line() +
+#   labs(title="Cavallinesia phenology data",
+#        y="Normalized leafing",
+#        x="Date") +
+#   theme_minimal() +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1),
+#         legend.position = "none")
 
 trees1<- unique(data$tree)
 years1<- unique(data$pheno_year)
@@ -133,14 +134,18 @@ n.years<- length(unique(year.id))
 
 data4dclone <- list(K=1, X=dcdim(data.matrix(test.data)), n=n, days=all.days, year=year.id, nyear=n.years)
 
-cl.seq <- c(1,4);
-n.iter<-1000;n.adapt<-500;n.update<-10;thin<-1;n.chains<-3;
+cl.seq <- c(1,4,8,16,32)
+n.iter <- 10000
+n.adapt <- 2000
+n.update <- 5000
+thin <- 5
+n.chains <- 3
+cl <- makePSOCKcluster(3)
 
-cl <- makePSOCKcluster(3) 
 inits.list <- list(
-  list(kd=runif(1,0,2), sigsq=runif(1,0,25), yTd= runif(n=length(unique(year.id)), 1, 365)),
-  list(kd=runif(1,0,2), sigsq=runif(1,0,25), yTd= runif(n=length(unique(year.id)), 1, 365)),
-  list(kd=runif(1,0,2), sigsq=runif(1,0,25), yTd= runif(n=length(unique(year.id)), 1, 365))
+  list(kd=runif(1,0,1), sigsq=runif(1,5,25), yTd= runif(n=length(unique(year.id)), 61, 210)),
+  list(kd=runif(1,0,1), sigsq=runif(1,5,25), yTd= runif(n=length(unique(year.id)), 61, 210)),
+  list(kd=runif(1,0,1), sigsq=runif(1,5,25), yTd= runif(n=length(unique(year.id)), 61, 210))
 )
 annual_model<- dc.parfit(cl, data4dclone, params=c("kd","sigsq","yTd"), model=leaves_year_fe, n.clones=cl.seq,
                         multiply="K",unchanged=c("n","nyear"),
@@ -151,8 +156,18 @@ annual_model<- dc.parfit(cl, data4dclone, params=c("kd","sigsq","yTd"), model=le
                         thin=thin
 )
 
-summary(annual_model)
-dcdiag(annual_model)
+summary_table <- summary(annual_model)
+stats_table <- summary_table$statistics
+
+yTd_rows <- grep("^yTd\\[", rownames(stats_table))
+rownames(stats_table)[yTd_rows] <- pheno_year_levels
+
+windows()
+grid.table(round(as.data.frame(stats_table), 4))
+
+diag_table<-dcdiag(annual_model)
+windows()
+grid.table(round(as.data.frame(diag_table), 4))
 
 results <- summary(annual_model)
 results$statistics[, "Mean"]

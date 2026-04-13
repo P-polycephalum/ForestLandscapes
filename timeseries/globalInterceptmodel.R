@@ -8,9 +8,9 @@ logit.pf <- function(kd,Td,x){
 }
 # JAGS model for intercepts
 leaves <- function(){
-  kd~ dunif(0,15)
-  Td~ dunif(1,365)
-  sigsq~ dunif(0.01,30)
+  kd~ dunif(0,2)
+  Td~ dunif(61,210)
+  sigsq~ dunif(10,25)
   for(j in 1:n){
     muf[j] <-  kd*(days[j]-Td)
   }
@@ -257,7 +257,7 @@ ggplot(all_before_threshold, aes(x=day, y=y_norm, group=tree_year, color=as.fact
   theme_minimal()
 
 
-cl.seq <- c(1,4,8,16,32)
+cl.seq <- c(1,2)
 n.iter <- 10000
 n.adapt <- 2000
 n.update <- 5000
@@ -273,9 +273,9 @@ data4dclone <- list(
   days = all_before_threshold$day
 )
 inits <- list(
-  list(kd=runif(1,0,15), Td=runif(1,1,365), sigsq=runif(1,0.01,30)),
-  list(kd=runif(1,0,15), Td=runif(1,1,365), sigsq=runif(1,0.01,30)),
-  list(kd=runif(1,0,15), Td=runif(1,1,365), sigsq=runif(1,0.01,30))
+  list(kd=runif(1,0,2), Td=runif(1,61,210), sigsq=runif(1,10,25)),
+  list(kd=runif(1,0,2), Td=runif(1,61,210), sigsq=runif(1,10,25)),
+  list(kd=runif(1,0,2), Td=runif(1,61,210), sigsq=runif(1,10,25))
 )
 
 leaves.dclone <- dc.parfit(
@@ -293,6 +293,8 @@ leaves.dclone <- dc.parfit(
   thin = thin,
   inits = inits
 )
+dctable(leaves.dclone)
+
 results <- summary(leaves.dclone)
 table_summary <- results$statistics
 windows()
@@ -355,5 +357,5 @@ ggsave("plots/cavallinesia_phenology_fit.png", width=10, height=6)
 
 
 ## the real thing happens between november and may as described by condit. we buffer by one month in each side. so my new prior should be oct 1 to june 30. 
-DOY_to_day(11, 1, 2020) # -30
-DOY_to_day(5, 30, 2020) # 303  # we will run with an appropiate prior
+DOY_to_day(11, 1, 2020) # -30 november 1 
+DOY_to_day(3, 30, 2020) # 303  # we will run with an appropiate priorm  march 30
