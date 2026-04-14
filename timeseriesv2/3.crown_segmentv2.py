@@ -13,8 +13,8 @@ from shapely.geometry import Polygon
 from shapely.ops import transform
 from shapely.affinity import translate
 from shapely.geometry import box
-from sam2.sam2_image_predictor import SAM2ImagePredictor
-from sam2.build_sam import build_sam2
+#from sam2.sam2_image_predictor import SAM2ImagePredictor
+#from sam2.build_sam import build_sam2
 from shapely.ops import transform as shp_transform
 from shapely.affinity import translate
 from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
@@ -362,10 +362,18 @@ def sam3_infer_crop(seg, img_chw_uint8, boxes_xyxy, object_ids):
 from canopyrs.engine.config_parsers import SegmenterConfig
 from canopyrs.engine.models.segmenter.sam3 import Sam3PredictorWrapper
 
+import torch
+print("torch", torch.__version__)
+print("cuda available", torch.cuda.is_available())
+print("cuda runtime", torch.version.cuda)
+print("gpu", torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)
+print("cc", torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None)
+
 cfg = SegmenterConfig.from_yaml(r"C:\Users\vasquezvicente\repo\CanopyRS\canopyrs\config\segmenters\sam3_multi_selvamask_FT.yaml")
 
-
 seg = Sam3PredictorWrapper(cfg)
+
+
 
 # ---------------------------------------------------
 # DATA
@@ -534,6 +542,24 @@ for i in pending_indices:
         boxes = crowns_to_boxes_local(bucket_crowns_local)
         if not boxes:
             continue
+
+        ###################################################
+        #debuggin lines
+        ##################################################
+        from PIL import Image
+        boxes
+        image_chw.shape
+
+        boxes_np = np.asarray(boxes, dtype=np.float32)
+        pil = Image.fromarray(zarr_img[..., :3]).convert("RGB")
+
+        with torch.inference_mode():
+            masks, scores = seg._predict_batch(pil, boxes_np)
+
+        print("masks:", None if masks is None else masks.shape, masks.dtype if masks is not None else None)
+        print("scores:", None if scores is None else scores.shape, scores.dtype if scores is not None else None)
+
+
         input_boxes = torch.tensor(boxes, device=device)
 
         predictor = SAM2ImagePredictor(sam2_model)
