@@ -13,11 +13,13 @@ from shapely.geometry import Polygon
 from shapely.ops import transform
 from shapely.affinity import translate
 from shapely.geometry import box
-#from sam2.sam2_image_predictor import SAM2ImagePredictor
-#from sam2.build_sam import build_sam2
+from canopyrs.engine.config_parsers import SegmenterConfig
+from canopyrs.engine.models.segmenter.sam3 import Sam3PredictorWrapper
 from shapely.ops import transform as shp_transform
 from shapely.affinity import translate
 from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
+from PIL import Image
+
 
 # ---------------------------------------------------
 # FUNCTIONS
@@ -283,97 +285,8 @@ tiles_folder = os.path.join(dir_address, "tiles")
 # ---------------------------------------------------
 # MODEL
 # ---------------------------------------------------
-import numpy as np
-import torch
-from PIL import Image
-
-def sam3_infer_crop(seg, img_chw_uint8, boxes_xyxy, object_ids):
-    # CHW -> HWC
-    image = img_chw_uint8[:3].transpose(1, 2, 0).astype(np.uint8)
-    orig_H, orig_W, _ = image.shape
-
-    boxes = boxes_xyxy.astype(np.float32).copy()
-
-    # resize to seg.target_tile_size like CanopyRS forward()
-    resized = (orig_H != seg.target_tile_size) or (orig_W != seg.target_tile_size)
-    if resized:
-        import cv2
-        image = cv2.resize(
-            image,
-            (seg.target_tile_size, seg.target_tile_size),
-            interpolation=cv2.INTER_LINEAR,
-        )
-        sx = seg.target_tile_size / orig_W
-        sy = seg.target_tile_size / orig_H
-        boxes[:, [0, 2]] *= sx
-        boxes[:, [1, 3]] *= sy
-
-    H, W, _ = image.shape
-
-    # clip + drop degenerate
-    boxes[:, 0] = np.clip(boxes[:, 0], 0, W)
-    boxes[:, 1] = np.clip(boxes[:, 1], 0, H)
-    boxes[:, 2] = np.clip(boxes[:, 2], 0, W)
-    boxes[:, 3] = np.clip(boxes[:, 3], 0, H)
-
-    valid = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
-    boxes = boxes[valid]
-    ids = [oid for oid, v in zip(object_ids, valid) if v]
-
-    if len(boxes) == 0:
-        return [], np.zeros((0, orig_H, orig_W), dtype=np.uint8), np.zeros((0,), dtype=np.float32)
-
-    pil = Image.fromarray(image).convert("RGB")
-
-    all_masks = []
-    all_scores = []
-    all_ids = []
-
-    with torch.inference_mode(), torch.autocast(
-        "cuda", dtype=torch.bfloat16, enabled=(seg.device.type == "cuda")
-    ):
-        for k in range(0, len(boxes), seg.config.box_batch_size):
-            box_batch = boxes[k:k + seg.config.box_batch_size].astype(np.float32)
-            ids_batch = ids[k:k + seg.config.box_batch_size]
-
-            masks, scores = seg._predict_batch(pil, box_batch)
-            if masks is None or len(masks) == 0:
-                continue
-
-            # resize masks back to *crop* size if we resized the image
-            if resized:
-                import cv2
-                masks = np.stack(
-                    [cv2.resize(m, (orig_W, orig_H), interpolation=cv2.INTER_NEAREST) for m in masks],
-                    axis=0,
-                )
-
-            all_masks.append(masks.astype(np.uint8))
-            all_scores.append(scores.astype(np.float32))
-            all_ids.extend(ids_batch)
-
-    if not all_masks:
-        return [], np.zeros((0, orig_H, orig_W), dtype=np.uint8), np.zeros((0,), dtype=np.float32)
-
-    masks_local = np.concatenate(all_masks, axis=0)   # (M, cropH, cropW)
-    scores = np.concatenate(all_scores, axis=0)       # (M,)
-    return all_ids, masks_local, scores
-
-from canopyrs.engine.config_parsers import SegmenterConfig
-from canopyrs.engine.models.segmenter.sam3 import Sam3PredictorWrapper
-
-import torch
-print("torch", torch.__version__)
-print("cuda available", torch.cuda.is_available())
-print("cuda runtime", torch.version.cuda)
-print("gpu", torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)
-print("cc", torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None)
-
 cfg = SegmenterConfig.from_yaml(r"C:\Users\vasquezvicente\repo\CanopyRS\canopyrs\config\segmenters\sam3_multi_selvamask_FT.yaml")
-
 seg = Sam3PredictorWrapper(cfg)
-
-
 
 # ---------------------------------------------------
 # DATA
@@ -438,6 +351,12 @@ def _read_bucket(bucket_id):
         crs="EPSG:32617"
     )
 
+def crowns_to_boxes_local(gdf):
+            boxes = []
+            for geom in gdf.geometry:
+                minx, miny, maxx, maxy = geom.bounds
+                boxes.append([minx, miny, maxx, maxy])
+            return boxes
 # ---------------------------------------------------
 # INITIAL REFERENCE / RESUME STATE  (reads only this bucket)
 # ---------------------------------------------------
@@ -481,12 +400,19 @@ print(f"Pending dates for bucket {bucket_to_process}: {len(pending_indices)}")
 # ---------------------------------------------------
 # MAIN LOOP
 # ---------------------------------------------------
+def _pick_geometry(row):
+    sim = row["similarity"] if "similarity" in row.index and pd.notna(row["similarity"]) else 0.0
+    if sim >= 0.5:
+        return row["geometry"]
+    gid = row["GlobalID"]
+    if gid in ref_geoms.index:
+        print(f"  ↩ Fallback to reference for GlobalID={gid} (similarity={sim:.2f})")
+        return ref_geoms.loc[gid]
+    return row["geometry"]
 
 for i in pending_indices:
-    i=48 # line for developing
     current_time = time[i]
 
-    # safety check in case this date got written in a prior partial run
     if _part_exists(bucket_to_process, current_time):
         print(f"Skipping already processed: {current_time}")
         tile_crowns = _read_part(bucket_to_process, current_time)
@@ -494,13 +420,9 @@ for i in pending_indices:
 
     print(f"\nTime {current_time}")
     crown_buckets = split_into_buckets(tile_crowns, grid_shape=(3, 3))
+
     time_rows = []
-
     for bucket_id, bucket_crowns in crown_buckets.items():
-
-        bucket_id = "0_0" # line for developing
-        bucket_crowns = crown_buckets[bucket_id].copy() # line for developing
-
         print(f"  Bucket {bucket_id} - crowns: {len(bucket_crowns)}")
         bucket_crowns_px = bucket_crowns.copy()
         bucket_crowns_px["geometry"] = bucket_crowns.geometry.apply(
@@ -526,120 +448,78 @@ for i in pending_indices:
             print(f"  Skipping empty crop for bucket {bucket_id}")
             continue
 
-        zarr_img = np.asarray(z[i, :3, ymin_px:ymax_px, xmin_px:xmax_px]).transpose(1, 2, 0)
-        image_chw= zarr_img.transpose(2, 0, 1)
-
-        bucket_crowns_local = bucket_crowns_px.copy()
-        bucket_crowns_local["geometry"] = bucket_crowns_px.geometry.apply(
-            lambda g: translate(g, xoff=-xmin_px, yoff=-ymin_px)
-        )
-        def crowns_to_boxes_local(gdf):
-            boxes = []
-            for geom in gdf.geometry:
-                minx, miny, maxx, maxy = geom.bounds
-                boxes.append([minx, miny, maxx, maxy])
-            return boxes
-        boxes = crowns_to_boxes_local(bucket_crowns_local)
-        if not boxes:
-            continue
-
-        ###################################################
-        #debuggin lines
-        ##################################################
-        from PIL import Image
-        boxes
-        image_chw.shape
-
-        boxes_np = np.asarray(boxes, dtype=np.float32)
-        pil = Image.fromarray(zarr_img[..., :3]).convert("RGB")
-
-        with torch.inference_mode():
-            masks, scores = seg._predict_batch(pil, boxes_np)
-
-        print("masks:", None if masks is None else masks.shape, masks.dtype if masks is not None else None)
-        print("scores:", None if scores is None else scores.shape, scores.dtype if scores is not None else None)
-
-
-        input_boxes = torch.tensor(boxes, device=device)
-
-        predictor = SAM2ImagePredictor(sam2_model)
         try:
-            predictor.set_image(zarr_img)
+            zarr_img = np.asarray(z[i, :3, ymin_px:ymax_px, xmin_px:xmax_px]).transpose(1, 2, 0)
+
+            bucket_crowns_local = bucket_crowns_px.copy()
+            bucket_crowns_local["geometry"] = bucket_crowns_px.geometry.apply(
+                lambda g: translate(g, xoff=-xmin_px, yoff=-ymin_px)
+            )
+
+            boxes = crowns_to_boxes_local(bucket_crowns_local)
+            boxes_np = np.asarray(boxes, dtype=np.float32)
+            pil = Image.fromarray(zarr_img[..., :3]).convert("RGB")
+            if not boxes:
+                print(f"  No valid boxes for bucket {bucket_id}. Skipping.")
+                continue
+
             with torch.inference_mode():
-                masks, scores, _ = predictor.predict(
-                    box=input_boxes,
-                    multimask_output=False,
-                )
+                masks, scores = seg._predict_batch(pil, boxes_np)
+            print("masks:", None if masks is None else masks.shape, masks.dtype if masks is not None else None)
+            print("scores:", None if scores is None else scores.shape, scores.dtype if scores is not None else None)
+
             for idx, (thisscore, thiscrown) in enumerate(zip(scores, masks)):
-                polygons = []
-                areas = []
-                best_idx = thisscore.argmax().item()
-                mask = thiscrown[best_idx]
-
-                if hasattr(mask, "cpu"):
-                    mask = mask.squeeze().cpu().numpy()
-                else:
-                    mask = np.squeeze(mask)
-                mask_np = (mask > 0).astype(np.uint8) * 255  # force binary 0/255
-
+                mask = np.squeeze(thiscrown)
+                mask_np = (mask > 0).astype(np.uint8) * 255
                 contours, _ = cv2.findContours(
                     mask_np,
                     cv2.RETR_EXTERNAL,
                     cv2.CHAIN_APPROX_SIMPLE,
                 )
 
+                crown_polygons = []
                 for contour in contours:
                     contour = contour.reshape(-1, 2)
-
                     if cv2.contourArea(contour) < 4:
                         continue
                     if contour.shape[0] < 3:
                         continue
-
                     x = contour[:, 0] + xmin_px
                     y = contour[:, 1] + ymin_px
                     coords = np.stack([x, y], axis=1)
-
                     poly = Polygon(coords).buffer(0)
                     if poly.is_empty or not poly.is_valid or poly.area <= 0:
                         continue
+                    crown_polygons.append(poly)
 
-                    polygons.append(poly)
-                    areas.append(poly.area)
-
-                if not polygons:
+                if not crown_polygons:
                     continue
 
-                largest_idx = int(np.argmax(areas))
+                best_poly = max(crown_polygons, key=lambda p: p.area)
                 row = {
-                    "geometry": polygons[largest_idx],
-                    "area": areas[largest_idx],
-                    "score": thisscore[best_idx].item(),
+                    "geometry": best_poly,
+                    "score": float(np.squeeze(thisscore)),
                     "time": time[i],
                     "bucket_id": bucket_to_process
                 }
-
                 if idx < len(bucket_crowns):
                     row["GlobalID"] = bucket_crowns.iloc[idx].get("GlobalID", None)
                     row["tag"] = bucket_crowns.iloc[idx].get("tag", None)
                     row["latin"] = bucket_crowns.iloc[idx].get("latin", None)
-
                 time_rows.append(row)
-        finally:
-            del predictor, input_boxes, zarr_img
-            if 'masks' in locals():
-                del masks
-            if 'scores' in locals():
-                del scores
-            if device.startswith("cuda"):
-                torch.cuda.empty_cache()
 
-    gc.collect()
+        finally:
+            for var in ['zarr_img', 'boxes', 'boxes_np', 'pil', 'masks', 'scores']:
+                if var in locals():
+                    del locals()[var]
+            gc.collect()
+
     gdf_tile = gpd.GeoDataFrame(time_rows, crs=None)
     gdf_tile["geometry"] = gdf_tile["geometry"].apply(
         lambda geom: pixel_to_utm(geom, att_transform)
     )
     gdf_tile = gdf_tile.set_crs(crs)
+
     gdf_tile = crownmap_metrics(
         original_crownmap=tile_crowns,
         segmented_crownmap=gdf_tile
@@ -655,32 +535,15 @@ for i in pending_indices:
 
     ref_geoms = tile_crowns.set_index("GlobalID")["geometry"]
 
-    
-    def _pick_geometry(row):
-        sim = row["similarity"] if "similarity" in row.index and pd.notna(row["similarity"]) else 0.0
-        if sim >= 0.5:
-            return row["geometry"]
-        gid = row["GlobalID"]
-        if gid in ref_geoms.index:
-            print(f"  ↩ Fallback to reference for GlobalID={gid} (similarity={sim:.2f})")
-            return ref_geoms.loc[gid]
-        return row["geometry"]
-
     gdf_tile2["geometry"] = gdf_tile2.apply(_pick_geometry, axis=1)
     gdf_tile2 = gpd.GeoDataFrame(gdf_tile2, crs=crs)
 
-    # -----------------------------------
-    # 💾 SAVE — write only this (bucket, time) slice
-    # -----------------------------------
     _write_part(gdf_tile2, bucket_to_process, current_time)
     print(f"Saved partition: bucket={bucket_to_process}, time={current_time} ({len(gdf_tile2)} rows)")
 
-    # -----------------------------------
-    # 🔁 UPDATE REFERENCE
-    # -----------------------------------
     tile_crowns = gdf_tile2.copy()
 
-    if device.startswith("cuda"):
+    if seg.device.type == "cuda":
         torch.cuda.empty_cache()
     del gdf_tile, gdf_tile2, crown_avoided_gdf
     print("Cleared GPU cache and deleted intermediate GDFs.")
