@@ -8,16 +8,13 @@ import rasterio
 import cv2
 import zarr
 from matplotlib import pyplot as plt     
-
 from affine import Affine
 from shapely.geometry import Polygon
 from shapely.ops import transform
 from shapely.affinity import translate
 from shapely.geometry import box
-
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 from sam2.build_sam import build_sam2
-
 from shapely.ops import transform as shp_transform
 from shapely.affinity import translate
 from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
@@ -230,11 +227,6 @@ def _pick_geometry(row):
             return ref_geoms.loc[gid]
         return row["geometry"]
 
-#####################################################################################
-CROWNMAP_PATH = r"D:\BCI_50ha_timeseries\crownmap\BCI_50ha_2022_2023_crownmap_raw.shp"
-tiles_folder= r"D:\BCI_50ha_timeseries\tiles"
-BUCKET_GRID_SHAPE = (2, 4)
-BUCKET_BUFFER_SIZE = 5
 def build_bucket_attributes(crownmap_path, tiles_folder, grid_shape=(2, 4), buffer_size=5):
     crownmap_gdf = gpd.read_file(crownmap_path)
     tile_files = sorted(
@@ -269,13 +261,19 @@ def build_bucket_attributes(crownmap_path, tiles_folder, grid_shape=(2, 4), buff
         }
 
     return crownmap_gdf, buckets, bucket_attributes
+#####################################################################################
+CROWNMAP_PATH = r"D:\BCI_50ha_timeseries\crownmap\BCI_50ha_2022_2023_crownmap_raw.shp"
+tiles_folder= r"D:\BCI_50ha_timeseries\tiles"
+BUCKET_GRID_SHAPE = (2, 4)
+BUCKET_BUFFER_SIZE = 5
+
 crownmap_gdf, buck, bucket_attributes = build_bucket_attributes(
     crownmap_path=CROWNMAP_PATH,
     tiles_folder=tiles_folder,
     grid_shape=BUCKET_GRID_SHAPE,
     buffer_size=BUCKET_BUFFER_SIZE,
 )
-#########################################################################
+
 # ---------------------------------------------------
 # PATHS
 # ---------------------------------------------------
@@ -285,15 +283,94 @@ tiles_folder = os.path.join(dir_address, "tiles")
 # ---------------------------------------------------
 # MODEL
 # ---------------------------------------------------
-device = "cuda"
-model_cfg = r"D:\BCI_50ha_timeseries\sam2.1_hiera_l.yaml"
-checkpoint = r"D:\BCI_50ha_timeseries\sam2.1_hiera_large.pt"
-sam2_model = build_sam2(model_cfg, checkpoint, device=device)
+import numpy as np
+import torch
+from PIL import Image
+
+def sam3_infer_crop(seg, img_chw_uint8, boxes_xyxy, object_ids):
+    # CHW -> HWC
+    image = img_chw_uint8[:3].transpose(1, 2, 0).astype(np.uint8)
+    orig_H, orig_W, _ = image.shape
+
+    boxes = boxes_xyxy.astype(np.float32).copy()
+
+    # resize to seg.target_tile_size like CanopyRS forward()
+    resized = (orig_H != seg.target_tile_size) or (orig_W != seg.target_tile_size)
+    if resized:
+        import cv2
+        image = cv2.resize(
+            image,
+            (seg.target_tile_size, seg.target_tile_size),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        sx = seg.target_tile_size / orig_W
+        sy = seg.target_tile_size / orig_H
+        boxes[:, [0, 2]] *= sx
+        boxes[:, [1, 3]] *= sy
+
+    H, W, _ = image.shape
+
+    # clip + drop degenerate
+    boxes[:, 0] = np.clip(boxes[:, 0], 0, W)
+    boxes[:, 1] = np.clip(boxes[:, 1], 0, H)
+    boxes[:, 2] = np.clip(boxes[:, 2], 0, W)
+    boxes[:, 3] = np.clip(boxes[:, 3], 0, H)
+
+    valid = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+    boxes = boxes[valid]
+    ids = [oid for oid, v in zip(object_ids, valid) if v]
+
+    if len(boxes) == 0:
+        return [], np.zeros((0, orig_H, orig_W), dtype=np.uint8), np.zeros((0,), dtype=np.float32)
+
+    pil = Image.fromarray(image).convert("RGB")
+
+    all_masks = []
+    all_scores = []
+    all_ids = []
+
+    with torch.inference_mode(), torch.autocast(
+        "cuda", dtype=torch.bfloat16, enabled=(seg.device.type == "cuda")
+    ):
+        for k in range(0, len(boxes), seg.config.box_batch_size):
+            box_batch = boxes[k:k + seg.config.box_batch_size].astype(np.float32)
+            ids_batch = ids[k:k + seg.config.box_batch_size]
+
+            masks, scores = seg._predict_batch(pil, box_batch)
+            if masks is None or len(masks) == 0:
+                continue
+
+            # resize masks back to *crop* size if we resized the image
+            if resized:
+                import cv2
+                masks = np.stack(
+                    [cv2.resize(m, (orig_W, orig_H), interpolation=cv2.INTER_NEAREST) for m in masks],
+                    axis=0,
+                )
+
+            all_masks.append(masks.astype(np.uint8))
+            all_scores.append(scores.astype(np.float32))
+            all_ids.extend(ids_batch)
+
+    if not all_masks:
+        return [], np.zeros((0, orig_H, orig_W), dtype=np.uint8), np.zeros((0,), dtype=np.float32)
+
+    masks_local = np.concatenate(all_masks, axis=0)   # (M, cropH, cropW)
+    scores = np.concatenate(all_scores, axis=0)       # (M,)
+    return all_ids, masks_local, scores
+
+from canopyrs.engine.config_parsers import SegmenterConfig
+from canopyrs.engine.models.segmenter.sam3 import Sam3PredictorWrapper
+
+cfg = SegmenterConfig.from_yaml(r"C:\Users\vasquezvicente\repo\CanopyRS\canopyrs\config\segmenters\sam3_multi_selvamask_FT.yaml")
+
+
+seg = Sam3PredictorWrapper(cfg)
 
 # ---------------------------------------------------
 # DATA
 # ---------------------------------------------------
-bucket_to_process = "1_2"
+bucket_to_process = "0_0"
 
 z = zarr.open(
     os.path.join(tiles_folder, "aligned_local", bucket_to_process, "cube.zarr"),
@@ -302,8 +379,6 @@ z = zarr.open(
 
 att_transform = Affine(*z.attrs['transform'])
 att_inversed = ~att_transform
-print("Affine Transform:", att_transform)
-print("Resolution: (", att_transform.a, ",", -att_transform.e, ")")
 time = z.attrs['time']
 crs = z.attrs['crs']
 
@@ -320,8 +395,7 @@ forward_indices = list(range(ref_idx + 1, len(time)))
 # We never read the whole dataset to append a new slice.
 # Layout: master_gdf_parts/{bucket_id}/{safe_time}.parquet
 # ---------------------------------------------------
-master_gdf_path = r"D:\BCI_50ha_timeseries\master_gdf.geoparquet"   # legacy monolithic path
-master_parts_dir = r"D:\BCI_50ha_timeseries\master_gdf_parts"         # new partitioned folder
+master_parts_dir = r"D:\BCI_50ha_timeseries\master_gdf_parts2"         # new partitioned folder
 os.makedirs(master_parts_dir, exist_ok=True)
 
 def _safe_time(time_str):
@@ -355,38 +429,6 @@ def _read_bucket(bucket_id):
                   ignore_index=True),
         crs="EPSG:32617"
     )
-
-# --- One-time migration from monolithic file to partition folder ---
-if os.path.exists(master_gdf_path) and not any(
-    os.path.isdir(os.path.join(master_parts_dir, d))
-    for d in os.listdir(master_parts_dir)
-    if os.path.isdir(os.path.join(master_parts_dir, d))
-):
-    print("Migrating monolithic master_gdf.geoparquet → partitioned folder (one-time)...")
-    _legacy = gpd.read_parquet(master_gdf_path)
-    _legacy = gpd.GeoDataFrame(_legacy, geometry="geometry", crs="EPSG:32617")
-    _legacy["time"] = _legacy["time"].astype(str)
-    _legacy["bucket_id"] = _legacy["bucket_id"].astype(str)
-    for (_bid, _t), _grp in _legacy.groupby(["bucket_id", "time"]):
-        _write_part(gpd.GeoDataFrame(_grp, crs="EPSG:32617"), _bid, _t)
-    print(f"Migration done: {len(_legacy)} rows split into partition files.")
-    del _legacy
-elif not os.path.exists(master_gdf_path):
-    # Brand new run — seed reference time from crownmap split
-    print("No existing data found. Seeding reference time slices from crownmap...")
-    for _bid, _bgdf in buck.items():
-        _bgdf = _bgdf.copy()
-        _bgdf["bucket_id"] = _bid
-        _bgdf["time"] = "2022-09-29T00:00:00"
-        # Normalize multipolygons -> largest polygon
-        for _idx, _row in _bgdf.iterrows():
-            _geom = _row.geometry
-            if isinstance(_geom, MultiPolygon):
-                _polys = [p for p in _geom.geoms if isinstance(p, Polygon) and not p.is_empty]
-                if _polys:
-                    _bgdf.at[_idx, "geometry"] = max(_polys, key=lambda p: p.area)
-        _write_part(gpd.GeoDataFrame(_bgdf, crs="EPSG:32617"), _bid, "2022-09-29T00:00:00")
-    print("Reference seed written.")
 
 # ---------------------------------------------------
 # INITIAL REFERENCE / RESUME STATE  (reads only this bucket)
@@ -433,6 +475,7 @@ print(f"Pending dates for bucket {bucket_to_process}: {len(pending_indices)}")
 # ---------------------------------------------------
 
 for i in pending_indices:
+    i=48 # line for developing
     current_time = time[i]
 
     # safety check in case this date got written in a prior partial run
@@ -444,7 +487,12 @@ for i in pending_indices:
     print(f"\nTime {current_time}")
     crown_buckets = split_into_buckets(tile_crowns, grid_shape=(3, 3))
     time_rows = []
+
     for bucket_id, bucket_crowns in crown_buckets.items():
+
+        bucket_id = "0_0" # line for developing
+        bucket_crowns = crown_buckets[bucket_id].copy() # line for developing
+
         print(f"  Bucket {bucket_id} - crowns: {len(bucket_crowns)}")
         bucket_crowns_px = bucket_crowns.copy()
         bucket_crowns_px["geometry"] = bucket_crowns.geometry.apply(
@@ -471,6 +519,7 @@ for i in pending_indices:
             continue
 
         zarr_img = np.asarray(z[i, :3, ymin_px:ymax_px, xmin_px:xmax_px]).transpose(1, 2, 0)
+        image_chw= zarr_img.transpose(2, 0, 1)
 
         bucket_crowns_local = bucket_crowns_px.copy()
         bucket_crowns_local["geometry"] = bucket_crowns_px.geometry.apply(
@@ -603,224 +652,6 @@ for i in pending_indices:
     # -----------------------------------
     # 🔁 UPDATE REFERENCE
     # -----------------------------------
-    tile_crowns = gdf_tile2.copy()
-
-    if device.startswith("cuda"):
-        torch.cuda.empty_cache()
-    del gdf_tile, gdf_tile2, crown_avoided_gdf
-    print("Cleared GPU cache and deleted intermediate GDFs.")
-
-
-
-########forward processing
-# ---------------------------------------------------
-# INITIAL REFERENCE / RESUME STATE
-# ---------------------------------------------------
-print("\n--- Forward Processing ---")
-bucket_master = _read_bucket(bucket_to_process)
-processed_times = set()
-if not bucket_master.empty:
-    processed_times = set(bucket_master["time"].astype(str).unique())
-
-# Find latest contiguous processed time from reference going forward
-ordered_times = [time[ref_idx]] + [time[i] for i in forward_indices]
-seed_time = None
-for t in ordered_times:
-    if t in processed_times:
-        seed_time = t
-    else:
-        break
-
-if seed_time is not None:
-    tile_crowns = bucket_master[bucket_master["time"].astype(str) == seed_time].copy()
-    print(f"Resume seed for bucket {bucket_to_process}: {seed_time} ({len(tile_crowns)} crowns)")
-else:
-    # fallback to reference crowns from crownmap split
-    tile_crowns = buck[bucket_to_process].copy()
-    tile_crowns["bucket_id"] = bucket_to_process
-    tile_crowns["time"] = time[ref_idx]
-    print(f"No saved state found for bucket {bucket_to_process}. Starting from reference.")
-
-# Build pending indices (skip already processed)
-pending_indices = []
-resume_started = False
-for i in forward_indices:
-    t = time[i]
-    if not resume_started:
-        if t in processed_times:
-            continue
-        resume_started = True
-    pending_indices.append(i)
-
-print(f"Pending dates for bucket {bucket_to_process}: {len(pending_indices)}")
-
-# ---------------------------------------------------
-# MAIN LOOP
-# ---------------------------------------------------
-att_transform = Affine(*z.attrs['transform'])
-att_inversed = ~att_transform
-
-for i in pending_indices:
-    current_time = time[i]
-    # safety check in case this date got written in a prior partial run
-    if _part_exists(bucket_to_process, current_time):
-        print(f"Skipping already processed: {current_time}")
-        tile_crowns = _read_part(bucket_to_process, current_time)
-        continue
-
-    print(f"\nTime {current_time}")
-    crown_buckets = split_into_buckets(tile_crowns, grid_shape=(3, 3))
-    time_rows = []
-    for bucket_id, bucket_crowns in crown_buckets.items():
-        print(f"  Bucket {bucket_id} - crowns: {len(bucket_crowns)}")
-        bucket_crowns_px = bucket_crowns.copy()
-        bucket_crowns_px["geometry"] = bucket_crowns.geometry.apply(
-            lambda geom: shp_transform(lambda x, y, z=None: att_inversed * (x, y), geom)
-        )
-        minx, miny, maxx, maxy = bucket_crowns_px.total_bounds
-        buffer = 100
-        minx -= buffer
-        miny -= buffer
-        maxx += buffer
-        maxy += buffer
-        xmin_px = int(np.clip(minx, 0, width))
-        xmax_px = int(np.clip(maxx, 0, width))
-        ymin_px = int(np.clip(miny, 0, height))
-        ymax_px = int(np.clip(maxy, 0, height))
-
-        xmin_px, xmax_px = sorted([xmin_px, xmax_px])
-        ymin_px, ymax_px = sorted([ymin_px, ymax_px])
-
-        if xmin_px == xmax_px or ymin_px == ymax_px:
-            print(f"  Skipping empty crop for bucket {bucket_id}")
-            continue
-
-        zarr_img = np.asarray(z[i, :3, ymin_px:ymax_px, xmin_px:xmax_px]).transpose(1, 2, 0)
-
-        bucket_crowns_local = bucket_crowns_px.copy()
-        bucket_crowns_local["geometry"] = bucket_crowns_px.geometry.apply(
-            lambda g: translate(g, xoff=-xmin_px, yoff=-ymin_px)
-        )
-        def crowns_to_boxes_local(gdf):
-            boxes = []
-            for geom in gdf.geometry:
-                minx, miny, maxx, maxy = geom.bounds
-                boxes.append([minx, miny, maxx, maxy])
-            return boxes
-        boxes = crowns_to_boxes_local(bucket_crowns_local)
-        if not boxes:
-            continue
-        input_boxes = torch.tensor(boxes, device=device)
-
-        predictor = SAM2ImagePredictor(sam2_model)
-        try:
-            predictor.set_image(zarr_img)
-
-            with torch.inference_mode():
-                masks, scores, _ = predictor.predict(
-                    box=input_boxes,
-                    multimask_output=False,
-                )
-
-            for idx, (thisscore, thiscrown) in enumerate(zip(scores, masks)):
-
-                # reset per crown
-                polygons = []
-                areas = []
-
-                best_idx = thisscore.argmax().item()
-                mask = thiscrown[best_idx]
-
-                if hasattr(mask, "cpu"):
-                    mask = mask.squeeze().cpu().numpy()
-                else:
-                    mask = np.squeeze(mask)
-                mask_np = (mask > 0).astype(np.uint8) * 255  # force binary 0/255
-
-                contours, _ = cv2.findContours(
-                    mask_np,
-                    cv2.RETR_EXTERNAL,
-                    cv2.CHAIN_APPROX_SIMPLE,
-                )
-
-                for contour in contours:
-                    contour = contour.reshape(-1, 2)
-
-                    if cv2.contourArea(contour) < 4:
-                        continue
-                    if contour.shape[0] < 3:
-                        continue
-
-                    x = contour[:, 0] + xmin_px
-                    y = contour[:, 1] + ymin_px
-                    coords = np.stack([x, y], axis=1)
-
-                    poly = Polygon(coords).buffer(0)
-                    if poly.is_empty or not poly.is_valid or poly.area <= 0:
-                        continue
-
-                    polygons.append(poly)
-                    areas.append(poly.area)
-
-                if not polygons:
-                    continue
-
-                largest_idx = int(np.argmax(areas))
-                row = {
-                    "geometry": polygons[largest_idx],
-                    "area": areas[largest_idx],
-                    "score": thisscore[best_idx].item(),
-                    "time": time[i],
-                    "bucket_id": bucket_to_process
-                }
-                if idx < len(bucket_crowns):
-                    row["GlobalID"] = bucket_crowns.iloc[idx].get("GlobalID", None)
-                    row["tag"] = bucket_crowns.iloc[idx].get("tag", None)
-                    row["latin"] = bucket_crowns.iloc[idx].get("latin", None)
-
-                time_rows.append(row)
-        finally:
-            del predictor, input_boxes, zarr_img
-            if 'masks' in locals():
-                del masks
-            if 'scores' in locals():
-                del scores
-            if device.startswith("cuda"):
-                torch.cuda.empty_cache()
-
-    gc.collect()
-    gdf_tile = gpd.GeoDataFrame(time_rows, crs=None)
-    gdf_tile["geometry"] = gdf_tile["geometry"].apply(
-        lambda geom: pixel_to_utm(geom, att_transform)
-    )
-    gdf_tile = gdf_tile.set_crs(crs)
-    gdf_tile = crownmap_metrics(
-        original_crownmap=tile_crowns,
-        segmented_crownmap=gdf_tile
-    )
-
-    crown_avoided_gdf = crown_avoid(gdf_tile)
-    gdf_tile2= crownmap_metrics(
-        original_crownmap=tile_crowns,
-        segmented_crownmap=crown_avoided_gdf
-    )
-    ref_geoms = tile_crowns.set_index("GlobalID")["geometry"]
-
-    def _pick_geometry(row):
-        sim = row["similarity"] if "similarity" in row.index and pd.notna(row["similarity"]) else 0.0
-        if sim >= 0.5:
-            return row["geometry"]
-        gid = row["GlobalID"]
-        if gid in ref_geoms.index:
-            print(f"  ↩ Fallback to reference for GlobalID={gid} (similarity={sim:.2f})")
-            return ref_geoms.loc[gid]
-        return row["geometry"]
-
-    gdf_tile2["geometry"] = gdf_tile2.apply(_pick_geometry, axis=1)
-    gdf_tile2 = gpd.GeoDataFrame(gdf_tile2, crs=crs)
-
-    _write_part(gdf_tile2, bucket_to_process, current_time)
-    print(f"Saved partition: bucket={bucket_to_process}, time={current_time} ({len(gdf_tile2)} rows)")
     tile_crowns = gdf_tile2.copy()
 
     if device.startswith("cuda"):

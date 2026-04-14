@@ -1,5 +1,6 @@
 import os
 import subprocess
+import numpy as np
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry import box
@@ -347,25 +348,25 @@ else:
     for date_base, missing_ids in missing_by_date.items():
         print(f"[MISSING] {date_base}: {missing_ids}")
 
-##################################################################################
-dir_address = r"D:\BCI_50ha_timeseries"
-json_path = os.path.join(dir_address, "bucket_attributes.json")
-# List tile rasters once.
-tile_files = sorted([f for f in os.listdir(tiles_folder) if f.endswith(".tif")])
-print(f"Found {len(tile_files)} tiles to process\n")
+# ##################################################################################
+# dir_address = r"D:\BCI_50ha_timeseries"
+# json_path = os.path.join(dir_address, "bucket_attributes.json")
+# # List tile rasters once.
+# tile_files = sorted([f for f in os.listdir(tiles_folder) if f.endswith(".tif")])
+# print(f"Found {len(tile_files)} tiles to process\n")
 
-# Add the per-bucket time-series file list to bucket attributes.
-for bucket_id in buck.keys():
-    tile_suffix = f"_tile_{bucket_id}.tif"
-    bucket_files = [
-        os.path.join(tiles_folder, tile_file)
-        for tile_file in tile_files
-        if tile_file.endswith(tile_suffix)
-    ]
-    bucket_attributes[bucket_id]["files"] = sorted(bucket_files)
+# # Add the per-bucket time-series file list to bucket attributes.
+# for bucket_id in buck.keys():
+#     tile_suffix = f"_tile_{bucket_id}.tif"
+#     bucket_files = [
+#         os.path.join(tiles_folder, tile_file)
+#         for tile_file in tile_files
+#         if tile_file.endswith(tile_suffix)
+#     ]
+#     bucket_attributes[bucket_id]["files"] = sorted(bucket_files)
 
-bucket_attributes.keys()
+# bucket_attributes.keys()
 
-#SAVE updated bucket attributes with file lists to json
-with open(json_path, "w") as f:
-    json.dump(bucket_attributes, f, indent=4)  
+# #SAVE updated bucket attributes with file lists to json
+# with open(json_path, "w") as f:
+#     json.dump(bucket_attributes, f, indent=4)  

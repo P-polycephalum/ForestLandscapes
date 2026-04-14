@@ -1,5 +1,4 @@
 from time import time
-
 import numpy as np
 from torch import layout
 import zarr
@@ -214,20 +213,16 @@ def _current_time_str():
 def _update_pending_label():
     pending_count_label.setText(f"Pending updates: {len(pending_tree_updates)}")
 
-
 def _selected_quality_value():
     btn = quality_value.checkedButton()
     return btn.text() if btn else "Not Checked"
-
 
 def _selected_flowering_value():
     btn = flowering_group.checkedButton()
     return btn.text() if btn else "No"
 
-
 def _selected_leafing_value():
     return int(leafing_slider.value())
-
 
 def _selected_ignore_value():
     btn = ignore_group.checkedButton()
@@ -235,10 +230,8 @@ def _selected_ignore_value():
         return False
     return btn.text().strip().lower() == "yes"
 
-
 def _selected_notes_value():
     return (notes_input.text() or "").strip()
-
 
 def _normalize_edited_flag(value):
     if pd.isna(value):
@@ -449,16 +442,13 @@ def update_polygons(event=None):
         return
 
     current_time_str = str(times[t_idx])
-    shapes = pixel_shapes_by_time.get(current_time_str, [])
+    shapes = pixel_shapes_by_time.get(current_time_str, []) #here it is 
     shapes_layer.data = shapes
     if shapes:
         shapes_layer.edge_width = 5
         shapes_layer.edge_color = "red"
         shapes_layer.opacity = 1.0
 
-# ---------------------------------------------------
-# TITLE
-# ---------------------------------------------------
 def update_title(event=None):
     if len(times) == 0:
         viewer.title = f"Tile: {tile_id} | No cube loaded"
@@ -467,7 +457,6 @@ def update_title(event=None):
     t_idx = int(viewer.dims.current_step[0])
     if 0 <= t_idx < len(times):
         viewer.title = f"Tile: {tile_id} | Time: {times[t_idx]}"
-
 
 def update_info_box(event=None):
     tree_id = (current_selected_tree_id or "").strip()
@@ -518,7 +507,6 @@ def update_info_box(event=None):
     if notes:
         lines.append(f"<b>Notes:</b> {notes}")
     info_box.setText("<br/>".join(lines))
-
 
 def load_tree_data_for_tile(tile_id_value, selected_tree_id=None):
     global pixel_shapes_by_time, pixel_shape_records_by_time, tree_centroid_by_id
@@ -606,8 +594,6 @@ def load_tree_data_for_tile(tile_id_value, selected_tree_id=None):
                 _records.append((_gid, _cp))
         pixel_shapes_by_time[_time_str_key] = _shapes
         pixel_shape_records_by_time[_time_str_key] = _records
-
-
 
 def load_tile_cube(new_tile_id, selected_tree_id=None):
     global tile_id, path, z, rgb, times, att_transform, inv_transform, image_layer, shapes_layer, pixel_shapes_by_time, pixel_shape_records_by_time, tree_centroid_by_id, tree_crown_area_by_id, original_geometry_by_key, loaded_edited_by_key, loaded_labels_by_key
@@ -845,7 +831,6 @@ def update_cube_from_selection(event=None):
         update_title()
         update_info_box()
 
-
 def update_polygons_for_selected_tree(event=None):
     if rgb is None or len(times) == 0 or shapes_layer is None:
         return
@@ -864,6 +849,8 @@ def update_polygons_for_selected_tree(event=None):
         return
 
     pending_key = (tile_id, time_str, tree_id)
+    print(f"[DEBUG] pending_key={pending_key!r}")
+    print(f"[DEBUG] pending_polygon_edits keys={list(pending_polygon_edits.keys())}")
     if pending_key in pending_polygon_edits:
         shapes_layer.data = _geom_to_pixel_parts(pending_polygon_edits[pending_key])
         pending_meta = pending_tree_updates.get(pending_key, {})
