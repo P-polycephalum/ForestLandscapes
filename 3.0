@@ -1,0 +1,5 @@
+Requirement already satisfied: zarr in c:\users\vasquezvicente\.conda\envs\labeler\lib\site-packages (2.18.3)
+Requirement already satisfied: asciitree in c:\users\vasquezvicente\.conda\envs\labeler\lib\site-packages (from zarr) (0.3.3)
+Requirement already satisfied: numpy>=1.24 in c:\users\vasquezvicente\.conda\envs\labeler\lib\site-packages (from zarr) (2.2.6)
+Requirement already satisfied: numcodecs>=0.10.0 in c:\users\vasquezvicente\.conda\envs\labeler\lib\site-packages (from zarr) (0.13.1)
+Requirement already satisfied: fasteners in c:\users\vasquezvicente\.conda\envs\labeler\lib\site-packages (from zarr) (0.20)

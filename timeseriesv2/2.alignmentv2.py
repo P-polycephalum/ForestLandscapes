@@ -142,12 +142,12 @@ def _make_file_kwargs(output_path):
         'fmt_out': 'GTIFF',
         'r_b4match': 1,
         's_b4match': 1,
-        'max_shift': 200,
+        'max_shift': 400,
         'max_iter': 20,
         'align_grids': True,
         'match_gsd': True,
         'binary_ws': False,
-        'nodata': (0, 0)
+        'nodata': (None, None)
     }
 def _has_valid_pixels(path, band=1, nodata=0):
     try:
@@ -315,6 +315,18 @@ def run_global_alignment(files, start_idx, reference_file, global_dir, categoric
     return backward_alignments, forward_alignments
 #################################################################################################
 
+def _strip_nodata(path):
+    """Remove the nodata tag from a GeoTIFF without touching pixel values."""
+    from osgeo import gdal
+    gdal.SetConfigOption("GDAL_PAM_ENABLED", "NO")
+    ds = gdal.Open(path, gdal.GA_Update)
+    if ds is not None:
+        for i in range(1, ds.RasterCount + 1):
+            ds.GetRasterBand(i).DeleteNoDataValue()
+        ds.FlushCache()
+        ds = None
+    gdal.SetConfigOption("GDAL_PAM_ENABLED", "YES")
+
 def run_local_direction(indices, start_reference, source_files, local_dir):
     reference_local = start_reference
     indices_list = list(indices)
@@ -349,7 +361,7 @@ def run_local_direction(indices, start_reference, source_files, local_dir):
                     "r_b4match": 2,
                     "s_b4match": 2,
                     "max_shift": 100,
-                    "nodata": (255, 255),
+                    "nodata": (None, None),
                     "ignore_errors": True,
                     "match_gsd": True,
                     "align_grids": True
@@ -357,11 +369,13 @@ def run_local_direction(indices, start_reference, source_files, local_dir):
                 CRL = COREG_LOCAL(reference_local, source_file, **kwargs_local)
                 CRL.calculate_spatial_shifts()
                 CRL.correct_shifts()
+                _strip_nodata(out_path)
                 reference_local = out_path
             except Exception as e:
                 tqdm.write(f"  Failed ({basename}): {e}")
                 tqdm.write(f"  Copying without local alignment: {basename}")
                 shutil.copy2(source_file, out_path)
+                _strip_nodata(out_path)
                 reference_local = out_path
 
 ###################################################################################################
@@ -419,6 +433,7 @@ def build_zarr_cube_from_folder(tile_folder, zarr_name="cube.zarr", chunks=(1, -
         shape=(len(tiles), bands, height, width),
         chunks=zarr_chunks,
         dtype=dtype,
+        zarr_format=2,
     )
 
     cube.attrs["crs"] = str(meta["crs"])
