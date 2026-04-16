@@ -15,8 +15,6 @@ from qtpy.QtWidgets import (QPushButton, QVBoxLayout, QWidget, QInputDialog,
                             QLineEdit)
 from qtpy.QtCore import QTimer, Qt
 
-#######################################
-save_path = r"D:\BCI_50ha_timeseries\master_gdf.geoparquet"  # legacy monolithic (for fallback)
 cube_root = r"D:\BCI_50ha_timeseries\tiles\aligned_local"
 master_parts_dir = r"D:\BCI_50ha_timeseries\master_gdf_parts"  # new partitioned folder
 # Camera control: 1.0 means "fit to view", >1 zooms in, <1 zooms out.
@@ -104,7 +102,9 @@ def read_part_filtered(bucket_id, global_id=None):
 list_of_tiles = sorted(os.listdir(cube_root))
 all_parquet_files = []
 for tile in list_of_tiles:
-    tile_gdf=gpd.read_parquet(os.path.join(master_parts_dir, tile, "2022-09-29T00-00-00.parquet"))
+    if not os.path.isdir(os.path.join(master_parts_dir, tile)):
+        continue
+    tile_gdf = gpd.read_parquet(os.path.join(master_parts_dir, tile, "2022-09-29T00-00-00.parquet"))
     all_parquet_files.append(tile_gdf)
 
 species_df = pd.concat(all_parquet_files, ignore_index=True)

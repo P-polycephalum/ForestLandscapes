@@ -4,20 +4,14 @@ import numpy as np
 import gc
 import geopandas as gpd
 import pandas as pd
-import rasterio
 import cv2
 import zarr
-from matplotlib import pyplot as plt     
 from affine import Affine
-from shapely.geometry import Polygon
-from shapely.ops import transform
-from shapely.affinity import translate
-from shapely.geometry import box
 from canopyrs.engine.config_parsers import SegmenterConfig
 from canopyrs.engine.models.segmenter.sam3 import Sam3PredictorWrapper
 from shapely.ops import transform as shp_transform
 from shapely.affinity import translate
-from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
+from shapely.geometry import Polygon, MultiPolygon, GeometryCollection, box
 from PIL import Image
 
 # ---------------------------------------------------
@@ -218,15 +212,15 @@ def split_into_buckets(gdf, x_size=250, y_size=250, n_tiles=None, grid_shape=Non
     )
     return buckets
 
-def _pick_geometry(row):
-        sim = row["similarity"] if "similarity" in row.index and pd.notna(row["similarity"]) else 0.0
-        if sim >= 0.5:
-            return row["geometry"]
-        gid = row["GlobalID"]
-        if gid in ref_geoms.index:
-            print(f"  ↩ Fallback to reference for GlobalID={gid} (similarity={sim:.2f})")
-            return ref_geoms.loc[gid]
+def _pick_geometry(row, ref_geoms):
+    sim = row["similarity"] if "similarity" in row.index and pd.notna(row["similarity"]) else 0.0
+    if sim >= 0.5:
         return row["geometry"]
+    gid = row["GlobalID"]
+    if gid in ref_geoms.index:
+        print(f"  ↩ Fallback to reference for GlobalID={gid} (similarity={sim:.2f})")
+        return ref_geoms.loc[gid]
+    return row["geometry"]
 
 def build_bucket_attributes(crownmap_path, tiles_folder, grid_shape=(2, 4), buffer_size=5):
     crownmap_gdf = gpd.read_file(crownmap_path)
@@ -262,16 +256,6 @@ def build_bucket_attributes(crownmap_path, tiles_folder, grid_shape=(2, 4), buff
         }
 
     return crownmap_gdf, buckets, bucket_attributes
-
-def _pick_geometry(row):
-    sim = row["similarity"] if "similarity" in row.index and pd.notna(row["similarity"]) else 0.0
-    if sim >= 0.5:
-        return row["geometry"]
-    gid = row["GlobalID"]
-    if gid in ref_geoms.index:
-        print(f"  ↩ Fallback to reference for GlobalID={gid} (similarity={sim:.2f})")
-        return ref_geoms.loc[gid]
-    return row["geometry"]
 
 def _safe_time(time_str):
     """Turn a time string into a safe filename component."""
@@ -311,58 +295,7 @@ def crowns_to_boxes_local(gdf):
                 minx, miny, maxx, maxy = geom.bounds
                 boxes.append([minx, miny, maxx, maxy])
             return boxes
-# ---------------------------------------------------
 
-#####################################################################################
-CROWNMAP_PATH = r"D:\BCI_50ha_timeseries\crownmap\BCI_50ha_2022_2023_crownmap_raw.shp"
-tiles_folder= r"D:\BCI_50ha_timeseries\tiles"
-BUCKET_GRID_SHAPE = (2, 4)
-BUCKET_BUFFER_SIZE = 5
-
-crownmap_gdf, buck, bucket_attributes = build_bucket_attributes(
-    crownmap_path=CROWNMAP_PATH,
-    tiles_folder=tiles_folder,
-    grid_shape=BUCKET_GRID_SHAPE,
-    buffer_size=BUCKET_BUFFER_SIZE,
-)
-
-dir_address = r"D:\BCI_50ha_timeseries"
-tiles_folder = os.path.join(dir_address, "tiles")
-
-cfg = SegmenterConfig.from_yaml(r"C:\Users\vasquezvicente\repo\CanopyRS\canopyrs\config\segmenters\sam3_multi_selvamask_FT.yaml")
-seg = Sam3PredictorWrapper(cfg)
-
-bucket_to_process = "0_0"
-
-z = zarr.open(
-    os.path.join(tiles_folder, "aligned_local", bucket_to_process, "cube.zarr"),
-    mode="r"
-)
-
-att_transform = Affine(*z.attrs['transform'])
-att_inversed = ~att_transform
-time = z.attrs['time']
-crs = z.attrs['crs']
-
-height, width = z.shape[2], z.shape[3]
-
-ref = "2022-09-29T00:00:00"
-ref_idx = time.index(ref)
-backward_indices = list(range(ref_idx - 1, -1, -1))
-forward_indices = list(range(ref_idx + 1, len(time)))
-
-# ---------------------------------------------------
-# MASTER GDF — PARTITIONED FOLDER
-# Each (bucket_id, time) is a separate small parquet file.
-# We never read the whole dataset to append a new slice.
-# Layout: master_gdf_parts/{bucket_id}/{safe_time}.parquet
-# ---------------------------------------------------
-master_parts_dir = r"D:\BCI_50ha_timeseries\master_gdf_parts"
-os.makedirs(master_parts_dir, exist_ok=True)
-
-# ---------------------------------------------------
-# DIRECTION LOOP
-# ---------------------------------------------------
 def process_direction(direction_indices):
     # Resume state — reads only this bucket's saved parts
     bucket_master = _read_bucket(bucket_to_process)
@@ -523,7 +456,7 @@ def process_direction(direction_indices):
 
         ref_geoms = tile_crowns.set_index("GlobalID")["geometry"]
 
-        gdf_tile2["geometry"] = gdf_tile2.apply(_pick_geometry, axis=1)
+        gdf_tile2["geometry"] = gdf_tile2.apply(_pick_geometry, axis=1, ref_geoms=ref_geoms)
         gdf_tile2 = gpd.GeoDataFrame(gdf_tile2, crs=crs)
 
         _write_part(gdf_tile2, bucket_to_process, current_time)
@@ -536,6 +469,60 @@ def process_direction(direction_indices):
         del gdf_tile, gdf_tile2, crown_avoided_gdf
         print("Cleared GPU cache and deleted intermediate GDFs.")
 
+#####################################################################################
+CROWNMAP_PATH = r"D:\BCI_50ha_timeseries\crownmap\BCI_50ha_2022_2023_crownmap_raw.shp"
+tiles_folder= r"D:\BCI_50ha_timeseries\tiles"
+BUCKET_GRID_SHAPE = (2, 4)
+BUCKET_BUFFER_SIZE = 5
+
+crownmap_gdf, buck, bucket_attributes = build_bucket_attributes(
+    crownmap_path=CROWNMAP_PATH,
+    tiles_folder=tiles_folder,
+    grid_shape=BUCKET_GRID_SHAPE,
+    buffer_size=BUCKET_BUFFER_SIZE,
+)
+
+dir_address = r"D:\BCI_50ha_timeseries"
+tiles_folder = os.path.join(dir_address, "tiles")
+
+cfg = SegmenterConfig.from_yaml(r"C:\Users\vasquezvicente\repo\CanopyRS\canopyrs\config\segmenters\sam3_multi_selvamask_FT.yaml")
+seg = Sam3PredictorWrapper(cfg)
+
+bucket_to_process = "0_1"
+
+z = zarr.open(
+    os.path.join(tiles_folder, "aligned_local", bucket_to_process, "cube.zarr"),
+    mode="r"
+)
+
+att_transform = Affine(*z.attrs['transform'])
+att_inversed = ~att_transform
+time = z.attrs['time']
+crs = z.attrs['crs']
+
+height, width = z.shape[2], z.shape[3]
+
+ref = "2022-09-29T00:00:00"
+ref_idx = time.index(ref)
+backward_indices = list(range(ref_idx - 1, -1, -1))
+forward_indices = list(range(ref_idx + 1, len(time)))
+
+# ---------------------------------------------------
+# MASTER GDF — PARTITIONED FOLDER
+# Each (bucket_id, time) is a separate small parquet file.
+# We never read the whole dataset to append a new slice.
+# Layout: master_gdf_parts/{bucket_id}/{safe_time}.parquet
+# ---------------------------------------------------
+master_parts_dir = r"D:\BCI_50ha_timeseries\master_gdf_parts"
+os.makedirs(master_parts_dir, exist_ok=True)
+
+#we got to save the reference time slice as well, so we can resume from it without reprocessing
+if not _part_exists(bucket_to_process, time[ref_idx]):
+    ref_gdf = buck[bucket_to_process].copy()
+    ref_gdf["bucket_id"] = bucket_to_process
+    ref_gdf["time"] = time[ref_idx]
+    _write_part(ref_gdf, bucket_to_process, time[ref_idx])
+    print(f"Saved reference slice for bucket {bucket_to_process}: {time[ref_idx]} ({len(ref_gdf)} crowns)")
 # ---------------------------------------------------
 # RUN BACKWARD THEN FORWARD
 # ---------------------------------------------------
