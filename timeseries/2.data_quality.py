@@ -1,61 +1,71 @@
 import os
 import pandas as pd
 import geopandas as gpd
-from timeseries.utils import generate_leafing_pdf, customFlowering, customLeafing, customFloweringNumeric
-import rasterio
 from shapely import box
 import matplotlib.pyplot as plt
 import shapely
-from rasterio.mask import mask
 import numpy as np
 from statistics import mode
 from PIL import Image
-#load polygons
-data_path=r"\\stri-sm01\ForestLandscapes\UAVSHARE\BCI_50ha_timeseries"
-path_ortho=os.path.join(data_path,"orthomosaic_aligned_local")
-path_crowns=os.path.join(data_path,r"geodataframes\BCI_50ha_crownmap_timeseries.shp")
-orthomosaic_path=os.path.join(data_path,"orthomosaic_aligned_local")
-orthomosaic_list=os.listdir(orthomosaic_path)
-crowns=gpd.read_file(path_crowns)
-crowns['polygon_id']= crowns['GlobalID']+"_"+crowns['date'].str.replace("_","-")
 
 #load main dataset of labels 
-labels_path=r"timeseries/dataset_raw/export_2025_05_30.csv"
+labels_path=r"timeseries/dataset_raw/export_2026_04_23.csv"
 labels=pd.read_csv(labels_path)
-labels.columns
-#We should deal with double labelling before going any further
-#add correction
-correction1=pd.read_csv(r'timeseries/dataset_corrections/check_01.csv')
-correction1['isFlowering']= "no"
-correction1['floweringIntensity']=0
-correction1['segmentation']="good"
-correction1=correction1[['polygon_id', 'leafing', 'latin', 'date', 'isFlowering', 'floweringIntensity', 'segmentation']]
-correction0=pd.read_csv(r'timeseries/dataset_corrections/check_0.csv')
-correction0['isFlowering']= "no"
-correction0['floweringIntensity']=0
-correction0['segmentation']="good"
-correction0=correction0[['polygon_id', 'leafing', 'latin', 'date', 'isFlowering', 'floweringIntensity', 'segmentation']]
-
-crowns_final= pd.concat([correction0, correction1,correction0, correction1,labels])
-
-#merge both datasets
-crowns_labeled= crowns_final.merge(crowns[['area', 'score', 'tag', 'iou', 'geometry','polygon_id']],
-                              left_on="polygon_id",
-                                right_on="polygon_id",
-                                  how="left")
 
 #Keep only good segmentation
-crowns_labeled= crowns_labeled[crowns_labeled["segmentation"]=="good"]
+crowns_labeled= labels[labels["segmentation"]=="good"]
 
 #how many repeated ones
-print("Repeated crowns: ",len(crowns_labeled)-len(crowns_labeled['polygon_id'].unique()))
+label_counts = crowns_labeled.groupby("polygon_id").size()
+dist = label_counts.value_counts().sort_index()
+dist.index.name = "n_labels"
+dist.name = "n_crowns"
+print(dist.to_frame())
+
+
+
+
+#mnost labeled species
+species_counts = crowns_labeled['latin'].value_counts()
+species_counts_filtered = species_counts[species_counts >= 200]
+fig, ax = plt.subplots(figsize=(14, max(6, len(species_counts_filtered) * 0.3)))
+species_counts_filtered.plot.barh(ax=ax)
+ax.set_xlabel('Count')
+ax.set_ylabel('Species')
+ax.set_title('Labeled Species Distribution')
+ax.tick_params(axis='y', labelsize=8)
+ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+plt.tight_layout()
+plt.show()
+
+#summary of flowering vs non flowering
+crowns_labeled
+flowering_counts = crowns_labeled['isFlowering'].value_counts()
+flowering_summary = pd.DataFrame({'count': flowering_counts, 'percentage': flowering_counts / flowering_counts.sum() * 100})
+print(flowering_summary)
+
+
+
+flowering = crowns_labeled[(crowns_labeled['isFlowering']== "yes") | (crowns_labeled['isFlowering']== "maybe")]
+
+species_counts_flowering = flowering['latin'].value_counts()
+species_counts_flowering = species_counts_flowering[species_counts_flowering >= 20]
+fig, ax = plt.subplots(figsize=(14, max(6, len(species_counts_flowering) * 0.3)))
+species_counts_flowering.plot.barh(ax=ax)
+ax.set_xlabel('Count')
+ax.set_ylabel('Species')
+ax.set_title('Flowering Labeled Species Distribution')
+ax.tick_params(axis='y', labelsize=8)
+ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
+plt.tight_layout()
+plt.show()
+
 
 
 def customLeafing(leafing_values):
     values = list(leafing_values)
     sd_values = np.std(values)
     if len(values) == 1:
-        print('Only one value available')
         return values[0]
     if len(values) >= 2 and sd_values <= 5:
         result= sum(values) / len(values)
@@ -108,19 +118,105 @@ def customFlowering(floweringValues):
     if "yes" in floweringValues and "no" in floweringValues:
         return "maybe"
     else:
-
+        return "no"
+    
 crowns_labeled_avg = crowns_labeled.groupby("polygon_id").agg({
     "leafing": customLeafing,
     "isFlowering":customFlowering,
     "floweringIntensity": customFloweringNumeric,
     "latin": "first",  
-    "geometry": "first",
     "date":"first",
-    "area":"first",
-    "tag":"first",
-    "iou":"first",
-    "score":"first"
 }).reset_index()
+
+crowns_labeled_avg = crowns_labeled_avg[~crowns_labeled_avg['leafing'].isna()]
+label_counts = crowns_labeled_avg.groupby("polygon_id").size()
+dist = label_counts.value_counts().sort_index()
+dist.index.name = "n_labels"
+dist.name = "n_crowns"
+print(dist.to_frame())
+
+import geopandas as gpd
+master_parts_dir = r"D:\BCI_50ha_timeseries\master_gdf_parts"  # new partitioned folder
+
+def _safe_time(time_str):
+    """Convert time string to safe filename component."""
+    return time_str.replace(":", "-").replace("/", "-")
+
+def read_part_by_time(bucket_id, time_str):
+    """Read a single parquet partition for one bucket and one time step."""
+    part_path = os.path.join(master_parts_dir, str(bucket_id), f"{_safe_time(time_str)}.parquet")
+    if not os.path.exists(part_path):
+        return gpd.GeoDataFrame()
+
+    try:
+        part_gdf = gpd.read_parquet(part_path)
+    except Exception as e:
+        print(f"⚠️ Error reading partition {part_path}: {e}")
+        return gpd.GeoDataFrame()
+
+    if not part_gdf.empty:
+        computed_crown_area = part_gdf.geometry.area
+        if "crown_area" not in part_gdf.columns:
+            part_gdf["crown_area"] = computed_crown_area
+        else:
+            missing_crown_area = part_gdf["crown_area"].isna()
+            if missing_crown_area.any():
+                part_gdf.loc[missing_crown_area, "crown_area"] = computed_crown_area.loc[missing_crown_area]
+
+    return gpd.GeoDataFrame(part_gdf, crs="EPSG:32617")
+
+def _write_part(gdf, bucket_id, time_str):
+    """Write a GeoDataFrame partition to disk."""
+    bucket_dir = os.path.join(master_parts_dir, str(bucket_id))
+    os.makedirs(bucket_dir, exist_ok=True)
+    part_path = os.path.join(bucket_dir, f"{_safe_time(time_str)}.parquet")
+    gdf.to_parquet(part_path, index=False)
+
+buckets= os.listdir(master_parts_dir)
+crowns_labeled_avg.columns
+
+label_cols = ['leafing', 'isFlowering', 'floweringIntensity']
+tmp_cols = {c: f"_new_{c}" for c in label_cols}
+
+for bucket in buckets:
+    bucket_path= os.path.join(master_parts_dir, bucket)
+    times= os.listdir(bucket_path)
+    times= [t.replace(".parquet","") for t in times]
+    for t in times:
+        data= read_part_by_time(bucket, t)
+        data['polygon_id']= data['GlobalID'].astype(str)+"_"+data['time'].str[:10]
+
+        if not data.empty:
+            print(f"Successfully read partition for bucket {bucket} and time {t}")
+            incoming = crowns_labeled_avg[['polygon_id'] + label_cols].rename(columns=tmp_cols)
+            merged_data = data.merge(incoming, on='polygon_id', how='left')
+            # Prefer master (data) values; only fill in from crowns_labeled_avg where master has no value
+            for col, tmp_col in tmp_cols.items():
+                if col not in merged_data.columns:
+                    merged_data[col] = merged_data[tmp_col]
+                else:
+                    merged_data[col] = merged_data[col].combine_first(merged_data[tmp_col])
+                merged_data.drop(columns=[tmp_col], inplace=True)
+            
+
+            n_with_labels = merged_data['leafing'].notna().sum()
+            n_without_labels = merged_data['leafing'].isna().sum()
+            if n_with_labels > 0:
+                 print(f"Rows with labels: {n_with_labels}, Rows without labels: {n_without_labels}")
+                 print(f"Sample of rows with labels for bucket {bucket} and time {t}:\n{merged_data[merged_data['leafing'].notna()].head()}")
+            _write_part(merged_data, bucket, t)
+        else:
+            print(f"No data found for bucket {bucket} and time {t}")
+
+tile= "0_0"
+time= "2018-04-04T00-00-00"
+crowns_labeled_avg['polygon_id']
+data= read_part_by_time(tile, time)
+data.columns
+
+crowns_labeled_avg['polygon_id']
+data['polygon_id']= data['GlobalID'].astype(str)+"_"+data['time'].str[:10]
+
 
 
 #split the dataset to the flowers dataset

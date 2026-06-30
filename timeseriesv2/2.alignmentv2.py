@@ -500,7 +500,7 @@ for bucket_to_align in bucket_attributes:
     local_cube_path = os.path.join(local_dir, "cube.zarr")
 
     skip_global = False
-    skip_local = False
+    skip_local = True
 
     if os.path.isdir(global_cube_path): #if global cube exists, check timesteps
         global_steps = _get_cube_timesteps(global_cube_path)

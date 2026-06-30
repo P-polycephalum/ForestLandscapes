@@ -86,7 +86,9 @@ for i, (_, row) in enumerate(flower_cnn_2.iterrows()):
         print("it already exists in dataset")
 
 
-client = labelbox.Client(api_key="")
+#################################################
+#call the labelbox API to pull the labels#
+
 
 #get the dataset that is currently in labelbox
 dataset = client.get_dataset("cm8bs9pgf00d40746btooascw")
@@ -106,6 +108,7 @@ stream=export_task.get_buffered_stream(stream_type=labelbox.StreamType.RESULT).s
 #get the names that are already in labelbox
 export_json = [data_row.json for data_row in export_task.get_buffered_stream()]
 global_keys = [item["data_row"]["external_id"] for item in export_json]
+print("Number of data rows in labelbox:", len(global_keys))
 
 #path to the raw flower dataset hosted in ForestLandscapes server
 data_path=r"\\stri-sm01\ForestLandscapes\UAVSHARE\BCI_50ha_timeseries"
@@ -161,19 +164,20 @@ except Exception as err:
     print(f'Error while creating labelbox dataset -  Error: {err}')
     task.errors
 
+import pandas as pd
+import labelbox
 
+def json_stream_handler(output: labelbox.BufferedJsonConverterOutput):
+  print(output.json)
+client = labelbox.Client(api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiJjbHRoYjZ4d2cwNXA3MDcxMGMzeTk1bTZjIiwib3JnYW5pemF0aW9uSWQiOiJjanF6bGVoNHcweGhxMDc3N2dqNDF0cHNrIiwiYXBpS2V5SWQiOiJjbW9zc2tpYTIwZWxlMDd0eTM5NmMwcTZoIiwic2VjcmV0IjoiMTFjYjFhY2E1Y2I0NmUzMWJjMjAzMjMyODI1MTMyNzUiLCJpYXQiOjE3Nzc5OTU0MjUsImV4cCI6MTc4MDQxNDYyNX0.I8vbnl7dBQEcxmgzWPZWa4sSqmanNKbDgHSYMTc2AXk")
 
 #bring back the exports after labelling
 project = client.get_project("cm8azfo2f037h074jgzid05f9")
 export_task = project.export()
 export_task.wait_till_done()
-
 stream=export_task.get_buffered_stream(stream_type=labelbox.StreamType.RESULT).start(stream_handler=json_stream_handler)
-
 export_json = [data_row.json for data_row in export_task.get_buffered_stream()]
-
 global_keys = [item["data_row"]["external_id"] for item in export_json]
-
 
 
 data = [] 
@@ -194,25 +198,38 @@ for row in export_json:
                 elif classification['name']== 'segmentation':
                     row_data['segmentation']=classification['radio_answer']['value']
                 elif classification['name'] == 'leafing':  # Fixed condition
-                    row_data['leafing'] = float(classification['text_answer']['content'])# Fixed access
+                    row_data['leafing'] = classification['text_answer']['content']
                 elif classification['name']== 'floweringIntensity':
-                    row_data['floweringIntensity']=float(classification['text_answer']['content'])
+                    row_data['floweringIntensity']=classification['text_answer']['content']
                 elif classification['name'] == 'flowering_liana':
                     row_data['flowering_liana'] = [answer['name'] for answer in classification['checklist_answers']][0]
     data.append(row_data)
      
 flowering_dataset= pd.DataFrame(data)
+
+import os
+import geopandas as gpd
 flowering_dataset['polygon_id'] = flowering_dataset['polygon_id'].apply(os.path.basename)
 flowering_dataset['polygon_id'] = flowering_dataset['polygon_id'].apply(lambda x: x.split(".")[0])
-
 flowering_dataset=flowering_dataset[~flowering_dataset['leafing'].isna()]
 
+flowering_dataset['isFlowering'].value_counts()
+crownmap = r"D:\BCI_50ha_timeseries\crownmap\BCI_50ha_2022_2023_crownmap_raw.shp"
+crownmap_gdf = gpd.read_file(crownmap)
+flowering_dataset['GlobalID']=flowering_dataset['polygon_id'].apply(lambda x: "_".join(x.split("_")[:-1]))
 
-flowering_dataset['isFlowering'] = flowering_dataset.apply(
-    lambda x: x['floweringIntensity'] if pd.notna(x['floweringIntensity']) 
-              else ('yes' if x['floweringIntensity'] > 0 else 'no'),
-    axis=1
-)
+crownmap_gdf['polygon_id']= crownmap_gdf['GlobalID']+"_"+crownmap_gdf['date'].str.replace("_","-")
+
+flowering_dataset= flowering_dataset.merge(crownmap_gdf[['GlobalID','latin']], on='GlobalID', how='left')
 
 
 flowering_dataset.to_csv('timeseries/dataset_corrections/flower_out.csv')
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(8, 6))
+flowering_dataset[flowering_dataset['isFlowering'].isin(['maybe', 'yes'])]['latin'].value_counts().plot(kind='barh')
+plt.title('Count of Flowering Trees by Latin Name')
+plt.xlabel('Count')
+plt.ylabel('Latin Name')
+plt.show()

@@ -9,6 +9,31 @@ import geopandas as gpd
 import json
 from collections import defaultdict
 
+# #lets do it here
+# import re
+# _date_re = re.compile(r"^(BCI_50ha_\d{4}_\d{2}_\d{2})")
+
+# combined_folder = r"D:\BCI_50ha_timeseries\combined"
+# dates_in_combined = sorted(set(
+#     m.group(1)
+#     for f in os.listdir(combined_folder) if f.endswith(".tif")
+#     for m in [_date_re.match(f)] if m
+# ))
+# print(f"Found {len(dates_in_combined)} unique dates in combined folder")
+
+# tiles_folder = r"D:\BCI_50ha_timeseries\tiles"
+# dates_in_tiles = sorted(set(
+#     m.group(1)
+#     for f in os.listdir(tiles_folder) if f.endswith(".tif")
+#     for m in [_date_re.match(f)] if m
+# ))
+# print(f"Found {len(dates_in_tiles)} unique dates in tiles folder")
+
+# missing_dates = sorted(set(dates_in_combined) - set(dates_in_tiles))
+# print(f"\nMissing from tiles ({len(missing_dates)} dates):")
+# for d in missing_dates:
+#     print(f"  {d}")
+
 def split_into_buckets(gdf, x_size=250, y_size=250, n_tiles=None, grid_shape=None):
     """
     Split polygons into buckets using centroid assignment.
@@ -314,22 +339,33 @@ while pass_num <= max_passes:
 
     prev_invalid_count = invalid_count
     pass_num += 1
-def find_missing_tiles_by_date(tiles_folder, buck):
+def find_missing_tiles_by_date(tiles_folder, buck, orthomosaics_folder=None):
     """
     Returns:
         dict[str, list[str]] where key = date base name (without _tile_*),
         value = missing bucket IDs for that date.
+
+    Also catches dates that exist as orthomosaics but have zero tiles (completely absent).
     """
-    expected_bucket_ids = {str(bid) for bid in buck.keys()}  # e.g. {"0_0","0_1",...,"1_3"}
+    expected_bucket_ids = {str(bid) for bid in buck.keys()}
     tiles_by_date = {}
 
     tile_files = [f for f in os.listdir(tiles_folder) if f.endswith(".tif")]
     for tf in tile_files:
         if "_tile_" not in tf:
             continue
-        stem = os.path.splitext(tf)[0]  # BCI_50ha_2024_08_07_orthomosaic_tile_0_0
-        date_base, bid = stem.rsplit("_tile_", 1)  # (..._orthomosaic, 0_0)
+        stem = os.path.splitext(tf)[0]
+        date_base, bid = stem.rsplit("_tile_", 1)
         tiles_by_date.setdefault(date_base, set()).add(bid)
+
+    # Also seed dates that have an orthomosaic but no tiles at all
+    if orthomosaics_folder and os.path.isdir(orthomosaics_folder):
+        for f in os.listdir(orthomosaics_folder):
+            if not f.endswith(".tif"):
+                continue
+            date_base = os.path.splitext(f)[0]  # e.g. BCI_50ha_2024_08_07_orthomosaic
+            if date_base not in tiles_by_date:
+                tiles_by_date[date_base] = set()  # no tiles present → all buckets missing
 
     missing_by_date = {}
     for date_base, present_ids in tiles_by_date.items():
@@ -339,7 +375,7 @@ def find_missing_tiles_by_date(tiles_folder, buck):
 
     return missing_by_date
 
-missing_by_date = find_missing_tiles_by_date(tiles_folder, buck)
+missing_by_date = find_missing_tiles_by_date(tiles_folder, buck, orthomosaics_folder=timeseries_orthomosaics)
 
 if not missing_by_date:
     print("All dates have all expected tiles.")

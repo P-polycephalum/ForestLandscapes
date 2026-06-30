@@ -212,9 +212,12 @@ def split_into_buckets(gdf, x_size=250, y_size=250, n_tiles=None, grid_shape=Non
     )
     return buckets
 
-def _pick_geometry(row, ref_geoms):
+RESEG_THRESHOLD = 0.7
+
+def _pick_geometry_reseg(row, ref_geoms):
+    """Keep new geometry only if it meets RESEG_THRESHOLD; otherwise fall back to seed."""
     sim = row["similarity"] if "similarity" in row.index and pd.notna(row["similarity"]) else 0.0
-    if sim >= 0.5:
+    if sim >= RESEG_THRESHOLD:
         return row["geometry"]
     gid = row["GlobalID"]
     if gid in ref_geoms.index:
@@ -289,225 +292,180 @@ def _read_bucket(bucket_id):
     )
 
 def crowns_to_boxes_local(gdf):
-            boxes = []
-            for geom in gdf.geometry:
-                minx, miny, maxx, maxy = geom.bounds
-                boxes.append([minx, miny, maxx, maxy])
-            return boxes
+    boxes = []
+    for geom in gdf.geometry:
+        minx, miny, maxx, maxy = geom.bounds
+        boxes.append([minx, miny, maxx, maxy])
+    return boxes
 
-def process_direction(direction_indices, resegment=False):
-    if resegment:
-        # Rebuild the propagation chain from the reference slice.
-        # Lock crowns with quality='Excellent' and resegment everything else.
-        ref_part = _part_path(bucket_to_process, time[ref_idx])
-        if os.path.exists(ref_part):
-            tile_crowns = gpd.read_parquet(ref_part)
-        else:
-            tile_crowns = buck[bucket_to_process].copy()
-            tile_crowns["bucket_id"] = bucket_to_process
-            tile_crowns["time"] = time[ref_idx]
-        pending_indices = list(direction_indices)
-        print(f"[RESEGMENT] {len(pending_indices)} dates to reprocess for bucket {bucket_to_process}")
-    else:
-        # Resume state — reads only this bucket's saved parts
-        bucket_master = _read_bucket(bucket_to_process)
-        processed_times = set()
-        if not bucket_master.empty:
-            processed_times = set(bucket_master["time"].astype(str).unique())
+def _segment_crowns(seed_crowns, time_idx):
+    """Run SAM on seed_crowns bounding boxes at time_idx. Returns list of row dicts (pixel space)."""
+    crown_buckets = split_into_buckets(seed_crowns, grid_shape=(3, 3))
+    time_rows = []
+    for bucket_id, bucket_crowns in crown_buckets.items():
+        print(f"  Sub-bucket {bucket_id} — crowns: {len(bucket_crowns)}")
+        bucket_crowns_px = bucket_crowns.copy()
+        bucket_crowns_px["geometry"] = bucket_crowns.geometry.apply(
+            lambda geom: shp_transform(lambda x, y, z=None: att_inversed * (x, y), geom)
+        )
+        minx, miny, maxx, maxy = bucket_crowns_px.total_bounds
 
-        ordered_times = [time[ref_idx]] + [time[i] for i in direction_indices]
-        seed_time = None
-        for t in ordered_times:
-            if t in processed_times:
-                seed_time = t
-            else:
-                break
+        buffer = 100
+        minx -= buffer; miny -= buffer; maxx += buffer; maxy += buffer
 
-        if seed_time is not None:
-            tile_crowns = bucket_master[bucket_master["time"].astype(str) == seed_time].copy()
-            print(f"Resume seed for bucket {bucket_to_process}: {seed_time} ({len(tile_crowns)} crowns)")
-        else:
-            tile_crowns = buck[bucket_to_process].copy()
-            tile_crowns["bucket_id"] = bucket_to_process
-            tile_crowns["time"] = time[ref_idx]
-            print(f"No saved state found for bucket {bucket_to_process}. Starting from reference.")
+        xmin_px = int(np.clip(minx, 0, width))
+        xmax_px = int(np.clip(maxx, 0, width))
+        ymin_px = int(np.clip(miny, 0, height))
+        ymax_px = int(np.clip(maxy, 0, height))
+        xmin_px, xmax_px = sorted([xmin_px, xmax_px])
+        ymin_px, ymax_px = sorted([ymin_px, ymax_px])
 
-        # Build pending indices (skip already processed)
-        pending_indices = []
-        resume_started = False
-        for i in direction_indices:
-            t = time[i]
-            if not resume_started:
-                if t in processed_times:
-                    continue
-                resume_started = True
-            pending_indices.append(i)
-
-        print(f"Pending dates for bucket {bucket_to_process}: {len(pending_indices)}")
-
-    for i in pending_indices:
-        current_time = time[i]
-        t_str = str(current_time)
-
-        if not resegment and _part_exists(bucket_to_process, current_time):
-            print(f"Skipping already processed: {current_time}")
-            tile_crowns = _read_part(bucket_to_process, current_time)
+        if xmin_px == xmax_px or ymin_px == ymax_px:
+            print(f"  Skipping empty crop for sub-bucket {bucket_id}")
             continue
 
-        # ── resegment: lock Excellent crowns, resegment everything else ──
-        locked = gpd.GeoDataFrame()
-        locked_ids = set()
-        if resegment and _part_exists(bucket_to_process, current_time):
-            existing = _read_part(bucket_to_process, current_time)
-            if "quality" in existing.columns:
-                q_col = existing["quality"].astype(str)
-                print(f"  [RESEGMENT] quality values in parquet: {q_col.unique().tolist()}")
-                locked = existing[q_col == "Excellent"].copy()
-                locked_ids = set(locked["GlobalID"].dropna())
-            else:
-                print(f"  [RESEGMENT] no 'quality' column in parquet")
-            print(f"  [RESEGMENT] {current_time}: {len(locked_ids)} locked (Excellent), "
-                  f"{max(0, len(tile_crowns) - len(locked_ids))} to resegment")
-
-        # crowns used as SAM prompts — exclude locked GlobalIDs
-        _crowns = tile_crowns[~tile_crowns["GlobalID"].isin(locked_ids)].copy() \
-                  if locked_ids else tile_crowns
-        print(f"\nTime {current_time}")
-        crown_buckets = split_into_buckets(_crowns, grid_shape=(3, 3))
-        time_rows = []
-        for bucket_id, bucket_crowns in crown_buckets.items():
-            print(f"  Bucket {bucket_id} - crowns: {len(bucket_crowns)}")
-            bucket_crowns_px = bucket_crowns.copy()
-            bucket_crowns_px["geometry"] = bucket_crowns.geometry.apply(
-                lambda geom: shp_transform(lambda x, y, z=None: att_inversed * (x, y), geom)
+        try:
+            zarr_img = np.asarray(z[time_idx, :3, ymin_px:ymax_px, xmin_px:xmax_px]).transpose(1, 2, 0)
+            bucket_crowns_local = bucket_crowns_px.copy()
+            bucket_crowns_local["geometry"] = bucket_crowns_px.geometry.apply(
+                lambda g: translate(g, xoff=-xmin_px, yoff=-ymin_px)
             )
-            minx, miny, maxx, maxy = bucket_crowns_px.total_bounds
-
-            buffer = 100
-            minx -= buffer
-            miny -= buffer
-            maxx += buffer
-            maxy += buffer
-
-            xmin_px = int(np.clip(minx, 0, width))
-            xmax_px = int(np.clip(maxx, 0, width))
-            ymin_px = int(np.clip(miny, 0, height))
-            ymax_px = int(np.clip(maxy, 0, height))
-
-            xmin_px, xmax_px = sorted([xmin_px, xmax_px])
-            ymin_px, ymax_px = sorted([ymin_px, ymax_px])
-
-            if xmin_px == xmax_px or ymin_px == ymax_px:
-                print(f"  Skipping empty crop for bucket {bucket_id}")
+            boxes = crowns_to_boxes_local(bucket_crowns_local)
+            if not boxes:
+                print(f"  No valid boxes for sub-bucket {bucket_id}. Skipping.")
                 continue
+            boxes_np = np.asarray(boxes, dtype=np.float32)
+            pil = Image.fromarray(zarr_img[..., :3]).convert("RGB")
 
-            try:
-                zarr_img = np.asarray(z[i, :3, ymin_px:ymax_px, xmin_px:xmax_px]).transpose(1, 2, 0)
-                bucket_crowns_local = bucket_crowns_px.copy()
-                bucket_crowns_local["geometry"] = bucket_crowns_px.geometry.apply(
-                    lambda g: translate(g, xoff=-xmin_px, yoff=-ymin_px)
-                )
+            with torch.inference_mode():
+                masks, scores = seg._predict_batch(pil, boxes_np)
 
-                boxes = crowns_to_boxes_local(bucket_crowns_local)
-                boxes_np = np.asarray(boxes, dtype=np.float32)
-                pil = Image.fromarray(zarr_img[..., :3]).convert("RGB")
-                if not boxes:
-                    print(f"  No valid boxes for bucket {bucket_id}. Skipping.")
-                    continue
-
-                with torch.inference_mode():
-                    masks, scores = seg._predict_batch(pil, boxes_np)
-
-                for idx, (thisscore, thiscrown) in enumerate(zip(scores, masks)):
-                    mask = np.squeeze(thiscrown)
-                    mask_np = (mask > 0).astype(np.uint8) * 255
-                    contours, _ = cv2.findContours(
-                        mask_np,
-                        cv2.RETR_EXTERNAL,
-                        cv2.CHAIN_APPROX_SIMPLE,
-                    )
-
-                    crown_polygons = []
-                    for contour in contours:
-                        contour = contour.reshape(-1, 2)
-                        if cv2.contourArea(contour) < 4:
-                            continue
-                        if contour.shape[0] < 3:
-                            continue
-                        x = contour[:, 0] + xmin_px
-                        y = contour[:, 1] + ymin_px
-                        coords = np.stack([x, y], axis=1)
-                        poly = Polygon(coords).buffer(0)
-                        if poly.is_empty or not poly.is_valid or poly.area <= 0:
-                            continue
-                        crown_polygons.append(poly)
-
-                    if not crown_polygons:
+            for idx, (thisscore, thiscrown) in enumerate(zip(scores, masks)):
+                mask = np.squeeze(thiscrown)
+                mask_np = (mask > 0).astype(np.uint8) * 255
+                contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                crown_polygons = []
+                for contour in contours:
+                    contour = contour.reshape(-1, 2)
+                    if cv2.contourArea(contour) < 4 or contour.shape[0] < 3:
                         continue
+                    x = contour[:, 0] + xmin_px
+                    y = contour[:, 1] + ymin_px
+                    poly = Polygon(np.stack([x, y], axis=1)).buffer(0)
+                    if poly.is_empty or not poly.is_valid or poly.area <= 0:
+                        continue
+                    crown_polygons.append(poly)
+                if not crown_polygons:
+                    continue
+                best_poly = max(crown_polygons, key=lambda p: p.area)
+                row = {
+                    "geometry": best_poly,
+                    "score": float(np.squeeze(thisscore)),
+                    "time": time[time_idx],
+                    "bucket_id": bucket_to_process,
+                }
+                if idx < len(bucket_crowns):
+                    row["GlobalID"] = bucket_crowns.iloc[idx].get("GlobalID", None)
+                    row["tag"] = bucket_crowns.iloc[idx].get("tag", None)
+                    row["latin"] = bucket_crowns.iloc[idx].get("latin", None)
+                time_rows.append(row)
+        finally:
+            for var in ['zarr_img', 'boxes', 'boxes_np', 'pil', 'masks', 'scores']:
+                if var in locals():
+                    del locals()[var]
+            gc.collect()
+    return time_rows
 
-                    best_poly = max(crown_polygons, key=lambda p: p.area)
-                    row = {
-                        "geometry": best_poly,
-                        "score": float(np.squeeze(thisscore)),
-                        "time": time[i],
-                        "bucket_id": bucket_to_process,
-                    }
-                    if idx < len(bucket_crowns):
-                        row["GlobalID"] = bucket_crowns.iloc[idx].get("GlobalID", None)
-                        row["tag"] = bucket_crowns.iloc[idx].get("tag", None)
-                        row["latin"] = bucket_crowns.iloc[idx].get("latin", None)
-                    time_rows.append(row)
+def process_direction_reseg(direction_indices):
+    """Resegment only crowns below RESEG_THRESHOLD. Excellent-quality crowns are kept as-is
+    and passed forward as the reference seed for the next time step."""
+    # Reference stays untouched — read it as the starting seed.
+    tile_crowns = _read_part(bucket_to_process, time[ref_idx]).copy()
+    print(f"Loaded reference seed: {time[ref_idx]} ({len(tile_crowns)} crowns)")
 
-            finally:
-                for var in ['zarr_img', 'boxes', 'boxes_np', 'pil', 'masks', 'scores']:
-                    if var in locals():
-                        del locals()[var]
-                gc.collect()
+    for i in direction_indices:
+        current_time = time[i]
 
-        gdf_tile = gpd.GeoDataFrame(time_rows, crs=None)
-        gdf_tile["geometry"] = gdf_tile["geometry"].apply(
+        if not _part_exists(bucket_to_process, current_time):
+            print(f"⚠️  Partition missing for {current_time} — cannot resegment. Skipping.")
+            continue
+
+        current_part = _read_part(bucket_to_process, current_time)
+
+        # --- classify crowns ---
+        def _sim(r):
+            s = r.get("similarity", None)
+            return float(s) if pd.notna(s) else 0.0
+
+        is_excellent = current_part.apply(
+            lambda r: str(r.get("quality", "")).strip().lower() == "excellent", axis=1
+        )
+        is_good = (~is_excellent) & current_part.apply(lambda r: _sim(r) >= RESEG_THRESHOLD, axis=1)
+        needs_reseg = ~is_excellent & ~is_good
+
+        n_excellent = int(is_excellent.sum())
+        n_good = int(is_good.sum())
+        n_reseg = int(needs_reseg.sum())
+        print(f"\nTime {current_time}: reseg={n_reseg}, already_good={n_good}, excellent(fixed)={n_excellent}")
+
+        keep_as_is = current_part[~needs_reseg].copy()
+        to_reseg_gids = set(current_part.loc[needs_reseg, "GlobalID"].astype(str))
+
+        if not to_reseg_gids:
+            print(f"  Nothing to resegment — updating seed and continuing.")
+            # Excellent crowns propagate their geometry as seed for next step.
+            tile_crowns = current_part.copy()
+            continue
+
+        # Use matching rows from tile_crowns (previous step's best geometry) as SAM prompts.
+        seed_crowns = tile_crowns[tile_crowns["GlobalID"].astype(str).isin(to_reseg_gids)].copy()
+        if seed_crowns.empty:
+            print(f"  No seed crowns found for reseg candidates — keeping existing partition.")
+            tile_crowns = current_part.copy()
+            continue
+
+        time_rows = _segment_crowns(seed_crowns, i)
+
+        if not time_rows:
+            print(f"  No new polygons produced — keeping existing partition for {current_time}.")
+            tile_crowns = current_part.copy()
+            continue
+
+        gdf_reseg = gpd.GeoDataFrame(time_rows, crs=None)
+        gdf_reseg["geometry"] = gdf_reseg["geometry"].apply(
             lambda geom: pixel_to_utm(geom, att_transform)
         )
-        gdf_tile = gdf_tile.set_crs(crs)
+        gdf_reseg = gdf_reseg.set_crs(crs)
+        gdf_reseg = crownmap_metrics(original_crownmap=seed_crowns, segmented_crownmap=gdf_reseg)
+        gdf_reseg = crown_avoid(gdf_reseg)
+        gdf_reseg = crownmap_metrics(original_crownmap=seed_crowns, segmented_crownmap=gdf_reseg)
 
-        gdf_tile = crownmap_metrics(
-            original_crownmap=_crowns,
-            segmented_crownmap=gdf_tile,
-        )
-
-        crown_avoided_gdf = crown_avoid(gdf_tile)
-
-        gdf_tile2 = crownmap_metrics(
-            original_crownmap=_crowns,
-            segmented_crownmap=crown_avoided_gdf,
-        )
-
-        ref_geoms = _crowns.set_index("GlobalID")["geometry"]
-
-        gdf_tile2["geometry"] = gdf_tile2.apply(_pick_geometry, axis=1, ref_geoms=ref_geoms)
+        ref_geoms = seed_crowns.set_index("GlobalID")["geometry"]
+        gdf_reseg["geometry"] = gdf_reseg.apply(_pick_geometry_reseg, axis=1, ref_geoms=ref_geoms)
         fallback_count = int((
-            gdf_tile2.apply(lambda r: (r["similarity"] if pd.notna(r.get("similarity")) else 0.0) < 0.5
-                            and r["GlobalID"] in ref_geoms.index, axis=1)
-        ).sum())
-        print(f"  ↩ Fell back to reference for {fallback_count}/{len(gdf_tile2)} crowns")
-        gdf_tile2 = gpd.GeoDataFrame(gdf_tile2, crs=crs)
-
-        # ── merge locked (Excellent) crowns back in ──
-        if not locked.empty:
-            gdf_tile2 = gpd.GeoDataFrame(
-                pd.concat([gdf_tile2, locked], ignore_index=True), crs=crs
+            gdf_reseg.apply(
+                lambda r: (float(r["similarity"]) if pd.notna(r.get("similarity")) else 0.0) < RESEG_THRESHOLD
+                          and r["GlobalID"] in ref_geoms.index,
+                axis=1,
             )
-            print(f"  🔒 Preserved {len(locked)} crown(s) with quality='Excellent'")
+        ).sum())
+        print(f"  ↩ Fell back to seed for {fallback_count}/{len(gdf_reseg)} reseg crowns")
+        gdf_reseg = gpd.GeoDataFrame(gdf_reseg, crs=crs)
 
-        _write_part(gdf_tile2, bucket_to_process, current_time)
-        print(f"Saved partition: bucket={bucket_to_process}, time={current_time} ({len(gdf_tile2)} rows)")
+        # Merge resegmented crowns back with the kept (Excellent + already-good) crowns.
+        result = gpd.GeoDataFrame(
+            pd.concat([keep_as_is, gdf_reseg], ignore_index=True), crs=crs
+        )
+        _write_part(result, bucket_to_process, current_time)
+        print(f"  Saved partition: bucket={bucket_to_process}, time={current_time} ({len(result)} rows)")
 
-        tile_crowns = gdf_tile2.copy()
+        # Excellent crowns carry their fixed geometry forward into the next seed.
+        tile_crowns = result.copy()
 
         if seg.device.type == "cuda":
             torch.cuda.empty_cache()
-        del gdf_tile, gdf_tile2, crown_avoided_gdf
-        print("Cleared GPU cache and deleted intermediate GDFs.")
+        del gdf_reseg, result
+        print("  Cleared GPU cache.")
 
 #####################################################################################
 CROWNMAP_PATH = r"D:\BCI_50ha_timeseries\crownmap\BCI_50ha_2022_2023_crownmap_raw.shp"
@@ -528,10 +486,10 @@ tiles_folder = os.path.join(dir_address, "tiles")
 cfg = SegmenterConfig.from_yaml(r"C:\Users\vasquezvicente\repo\CanopyRS\canopyrs\config\segmenters\sam3_multi_selvamask_FT.yaml")
 seg = Sam3PredictorWrapper(cfg)
 
-bucket_to_process = "0_2"
+bucket_to_process = "0_3"
 
 z = zarr.open(
-    os.path.join(tiles_folder, "aligned_global", bucket_to_process, "cube.zarr"),
+    os.path.join(tiles_folder, "aligned_local", bucket_to_process, "cube.zarr"),
     mode="r"
 )
 
@@ -556,47 +514,14 @@ forward_indices = list(range(ref_idx + 1, len(time)))
 master_parts_dir = r"D:\BCI_50ha_timeseries\master_gdf_parts"
 os.makedirs(master_parts_dir, exist_ok=True)
 
-#we got to save the reference time slice as well, so we can resume from it without reprocessing
+# Resegment pass: reference partition must already exist (written by crown_segment).
 if not _part_exists(bucket_to_process, time[ref_idx]):
-    ref_gdf = buck[bucket_to_process].copy()
-    ref_gdf["bucket_id"] = bucket_to_process
-    ref_gdf["time"] = time[ref_idx]
-    _write_part(ref_gdf, bucket_to_process, time[ref_idx])
-    print(f"Saved reference slice for bucket {bucket_to_process}: {time[ref_idx]} ({len(ref_gdf)} crowns)")
-# ---------------------------------------------------
-# RUN BACKWARD THEN FORWARD
-# Auto-detect resegment mode: if every timestep already has a parquet file,
-# run in resegment mode — crowns with quality='Excellent' are preserved verbatim,
-# everything else is re-run through SAM.
-# ---------------------------------------------------
-all_times = (
-    [time[ref_idx]]
-    + [time[i] for i in backward_indices]
-    + [time[i] for i in forward_indices]
-)
-bucket_is_full = all(_part_exists(bucket_to_process, t) for t in all_times)
-
-# ── Diagnostic: quality value_counts per parquet ─────────────────────────
-_bucket_dir = os.path.join(master_parts_dir, str(bucket_to_process))
-if os.path.isdir(_bucket_dir):
-    _parquet_files = sorted(f for f in os.listdir(_bucket_dir) if f.endswith(".parquet"))
-    print(f"\n=== quality value_counts for bucket {bucket_to_process} ({len(_parquet_files)} files) ===")
-    for _pf in _parquet_files:
-        _df = gpd.read_parquet(os.path.join(_bucket_dir, _pf))
-        if "quality" in _df.columns:
-            _vc = _df["quality"].astype(str).value_counts().to_dict()
-        else:
-            _vc = "NO QUALITY COLUMN"
-        print(f"  {_pf}: {_vc}")
-    print("=" * 60)
-
-if bucket_is_full:
-    print(
-        f"Bucket {bucket_to_process} is fully segmented ({len(all_times)} dates).\n"
-        f"Running in RESEGMENT mode — crowns with quality='Excellent' will be preserved."
+    raise RuntimeError(
+        f"Reference partition missing for bucket={bucket_to_process}, time={time[ref_idx]}. "
+        "Run 3.crown_segmentv2.py first."
     )
-    process_direction(backward_indices, resegment=True)
-    process_direction(forward_indices, resegment=True)
-else:
-    process_direction(backward_indices)
-    process_direction(forward_indices)
+# ---------------------------------------------------
+# RUN BACKWARD THEN FORWARD (resegment pass)
+# ---------------------------------------------------
+process_direction_reseg(backward_indices)
+process_direction_reseg(forward_indices)
